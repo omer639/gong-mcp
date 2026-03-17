@@ -62,9 +62,10 @@ interface GongRetrieveTranscriptsResponse {
 }
 
 interface GongListCallsArgs {
-  [key: string]: string | undefined;
+  [key: string]: string | number | undefined;
   fromDateTime?: string;
   toDateTime?: string;
+  limit?: number;
 }
 
 interface GongRetrieveTranscriptsArgs {
@@ -125,12 +126,29 @@ class GongClient {
     return response.data as T;
   }
 
-  async listCalls(fromDateTime?: string, toDateTime?: string): Promise<GongListCallsResponse> {
-    const params: GongListCallsArgs = {};
-    if (fromDateTime) params.fromDateTime = fromDateTime;
+  async listCalls(fromDateTime?: string, toDateTime?: string, limit?: number): Promise<GongListCallsResponse> {
+    // Default to 90 days ago when no fromDateTime is provided, so "recent calls" works correctly
+    const defaultFrom = new Date();
+    defaultFrom.setDate(defaultFrom.getDate() - 90);
+
+    const params: Record<string, string> = {
+      fromDateTime: fromDateTime ?? defaultFrom.toISOString(),
+    };
     if (toDateTime) params.toDateTime = toDateTime;
 
-    return this.request<GongListCallsResponse>('GET', '/calls', params);
+    const response = await this.request<GongListCallsResponse>('GET', '/calls', params);
+
+    // Sort by started time descending (most recent first)
+    const calls = (response.calls ?? []).sort((a, b) => {
+      const aTime = a.started ?? a.scheduled ?? '';
+      const bTime = b.started ?? b.scheduled ?? '';
+      return bTime.localeCompare(aTime);
+    });
+
+    // Apply limit if specified
+    const limitedCalls = limit != null ? calls.slice(0, limit) : calls;
+
+    return { ...response, calls: limitedCalls };
   }
 
   async retrieveTranscripts(callIds: string[]): Promise<GongRetrieveTranscriptsResponse> {
@@ -150,17 +168,21 @@ const gongClient = new GongClient(GONG_ACCESS_KEY, GONG_ACCESS_SECRET);
 // Tool definitions
 const LIST_CALLS_TOOL: Tool = {
   name: "list_calls",
-  description: "List Gong calls with optional date range filtering. Returns call details including ID, title, start/end times, participants, and duration.",
+  description: "List Gong calls sorted by most recent first. Defaults to the last 90 days when no date range is specified. Returns call details including ID, title, start/end times, and duration.",
   inputSchema: {
     type: "object",
     properties: {
       fromDateTime: {
         type: "string",
-        description: "Start date/time in ISO format (e.g. 2024-03-01T00:00:00Z)"
+        description: "Start date/time in ISO format (e.g. 2024-03-01T00:00:00Z). Defaults to 90 days ago."
       },
       toDateTime: {
         type: "string",
-        description: "End date/time in ISO format (e.g. 2024-03-31T23:59:59Z)"
+        description: "End date/time in ISO format (e.g. 2024-03-31T23:59:59Z). Defaults to now."
+      },
+      limit: {
+        type: "number",
+        description: "Maximum number of calls to return (most recent first). Defaults to all calls in the date range."
       }
     }
   }
@@ -201,7 +223,8 @@ function isGongListCallsArgs(args: unknown): args is GongListCallsArgs {
     typeof args === "object" &&
     args !== null &&
     (!("fromDateTime" in args) || typeof (args as GongListCallsArgs).fromDateTime === "string") &&
-    (!("toDateTime" in args) || typeof (args as GongListCallsArgs).toDateTime === "string")
+    (!("toDateTime" in args) || typeof (args as GongListCallsArgs).toDateTime === "string") &&
+    (!("limit" in args) || typeof (args as GongListCallsArgs).limit === "number")
   );
 }
 
@@ -233,8 +256,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: { params: { name
         if (!isGongListCallsArgs(args)) {
           throw new Error("Invalid arguments for list_calls");
         }
-        const { fromDateTime, toDateTime } = args;
-        const response = await gongClient.listCalls(fromDateTime, toDateTime);
+        const { fromDateTime, toDateTime, limit } = args;
+        const response = await gongClient.listCalls(fromDateTime, toDateTime, limit);
         return {
           content: [{ 
             type: "text", 
