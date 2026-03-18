@@ -72,6 +72,24 @@ interface GongRetrieveTranscriptsArgs {
   callIds: string[];
 }
 
+interface GongHighlightsArgs {
+  callId: string;
+}
+
+interface GongHighlight {
+  title?: string;
+  items?: Array<{ description: string; speakerId?: string; startTime?: number }>;
+}
+
+interface GongCallHighlightsResponse {
+  callId: string;
+  highlights?: GongHighlight[];
+  brief?: string;
+  outline?: Array<{ title: string; duration?: number }>;
+  callOutcome?: { outcome: string; description?: string };
+  keyPoints?: Array<{ text: string }>;
+}
+
 // Gong API Client
 class GongClient {
   private accessKey: string;
@@ -151,6 +169,40 @@ class GongClient {
     return { ...response, calls: limitedCalls };
   }
 
+  async getCallHighlights(callId: string): Promise<GongCallHighlightsResponse> {
+    const response = await this.request<{ calls: Array<{ metaData: { id: string }; content: Record<string, unknown> }> }>(
+      'POST', '/calls/extensive', undefined,
+      {
+        filter: { callIds: [callId] },
+        contentSelector: {
+          exposedFields: {
+            content: {
+              highlights: true,
+              brief: true,
+              outline: true,
+              callOutcome: true,
+              keyPoints: true,
+            }
+          }
+        }
+      }
+    );
+
+    const call = response.calls?.[0];
+    if (!call) {
+      return { callId, highlights: [] };
+    }
+
+    return {
+      callId,
+      highlights: call.content?.highlights as GongHighlight[],
+      brief: call.content?.brief as string,
+      outline: call.content?.outline as Array<{ title: string; duration?: number }>,
+      callOutcome: call.content?.callOutcome as { outcome: string; description?: string },
+      keyPoints: call.content?.keyPoints as Array<{ text: string }>,
+    };
+  }
+
   async retrieveTranscripts(callIds: string[]): Promise<GongRetrieveTranscriptsResponse> {
     return this.request<GongRetrieveTranscriptsResponse>('POST', '/calls/transcript', undefined, {
       filter: {
@@ -185,6 +237,21 @@ const LIST_CALLS_TOOL: Tool = {
         description: "Maximum number of calls to return (most recent first). Defaults to all calls in the date range."
       }
     }
+  }
+};
+
+const GET_CALL_HIGHLIGHTS_TOOL: Tool = {
+  name: "get_call_highlights",
+  description: "Retrieve AI-generated highlights for a specific Gong call, including a brief summary, key points, call outcome, outline, and next steps. Note: highlights may take 3+ hours after a call ends to become available.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      callId: {
+        type: "string",
+        description: "The Gong call ID to retrieve highlights for"
+      }
+    },
+    required: ["callId"]
   }
 };
 
@@ -228,6 +295,15 @@ function isGongListCallsArgs(args: unknown): args is GongListCallsArgs {
   );
 }
 
+function isGongHighlightsArgs(args: unknown): args is GongHighlightsArgs {
+  return (
+    typeof args === "object" &&
+    args !== null &&
+    "callId" in args &&
+    typeof (args as GongHighlightsArgs).callId === "string"
+  );
+}
+
 function isGongRetrieveTranscriptsArgs(args: unknown): args is GongRetrieveTranscriptsArgs {
   return (
     typeof args === "object" &&
@@ -240,7 +316,7 @@ function isGongRetrieveTranscriptsArgs(args: unknown): args is GongRetrieveTrans
 
 // Tool handlers
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [LIST_CALLS_TOOL, RETRIEVE_TRANSCRIPTS_TOOL],
+  tools: [LIST_CALLS_TOOL, RETRIEVE_TRANSCRIPTS_TOOL, GET_CALL_HIGHLIGHTS_TOOL],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request: { params: { name: string; arguments?: unknown } }) => {
@@ -276,6 +352,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request: { params: { name
         return {
           content: [{ 
             type: "text", 
+            text: JSON.stringify(response, null, 2)
+          }],
+          isError: false,
+        };
+      }
+
+      case "get_call_highlights": {
+        if (!isGongHighlightsArgs(args)) {
+          throw new Error("Invalid arguments for get_call_highlights");
+        }
+        const { callId } = args;
+        const response = await gongClient.getCallHighlights(callId);
+        return {
+          content: [{
+            type: "text",
             text: JSON.stringify(response, null, 2)
           }],
           isError: false,
