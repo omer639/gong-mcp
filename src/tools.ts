@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
-import { GongApiError, type GongClient, type GongTranscript } from "./gong-client.js";
+import { GongApiError, type GongCallTranscript, type GongClient } from "./gong-client.js";
 
 /**
  * Ceiling on the text of a single tool result.
@@ -61,30 +61,36 @@ function timestamp(ms: number): string {
  * the bytes of the text it carries. Reading is the point of this tool, so this
  * is the default shape; `format: "json"` returns the raw payload.
  */
-function formatTranscripts(transcripts: GongTranscript[]): string {
-  if (transcripts.length === 0) {
+function formatTranscripts(callTranscripts: GongCallTranscript[]): string {
+  if (callTranscripts.length === 0) {
     return "No transcripts returned. The calls may not be transcribed yet, or the API key may lack access to them.";
   }
 
-  const byCall = new Map<string, GongTranscript[]>();
-  for (const transcript of transcripts) {
-    const key = transcript.callId ?? "(unknown call)";
-    const existing = byCall.get(key);
-    if (existing) existing.push(transcript);
-    else byCall.set(key, [transcript]);
-  }
-
   const sections: string[] = [];
-  for (const [callId, monologues] of byCall) {
+  for (const { callId, transcript } of callTranscripts) {
+    const monologues = transcript ?? [];
     const lines = [`## Call ${callId}`];
+
+    if (monologues.length === 0) {
+      lines.push("(no transcript content — the call may not be transcribed yet)");
+    }
+
+    // `topic` repeats on every monologue in a stretch; only note it when it changes.
+    let currentTopic: string | undefined;
     for (const monologue of monologues) {
       const sentences = monologue.sentences ?? [];
       if (sentences.length === 0) continue;
+
+      if (monologue.topic && monologue.topic !== currentTopic) {
+        currentTopic = monologue.topic;
+        lines.push(`\n### ${monologue.topic}`);
+      }
+
       const speaker = monologue.speakerId ?? "unknown";
-      const topic = monologue.topic ? ` (${monologue.topic})` : "";
       const text = sentences.map((sentence) => sentence.text).join(" ");
-      lines.push(`[${timestamp(sentences[0].start)}] ${speaker}${topic}: ${text}`);
+      lines.push(`[${timestamp(sentences[0].start)}] ${speaker}: ${text}`);
     }
+
     sections.push(lines.join("\n"));
   }
 
@@ -159,11 +165,11 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
     },
     async ({ callIds, format }) => {
       try {
-        const transcripts = await getClient().retrieveTranscripts(callIds);
+        const callTranscripts = await getClient().retrieveTranscripts(callIds);
         const narrowingHint = "Request fewer call IDs per call.";
         return format === "json"
-          ? jsonResult({ transcripts }, narrowingHint)
-          : guardSize(formatTranscripts(transcripts), narrowingHint);
+          ? jsonResult({ callTranscripts }, narrowingHint)
+          : guardSize(formatTranscripts(callTranscripts), narrowingHint);
       } catch (error) {
         return errorResult(describeError(error));
       }

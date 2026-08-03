@@ -24,11 +24,20 @@ export interface GongCall {
   url?: string;
 }
 
-export interface GongTranscript {
-  callId?: string;
+/** One speaker's uninterrupted run of sentences. */
+export interface GongMonologue {
   speakerId: string;
   topic?: string;
   sentences: Array<{ start: number; end?: number; text: string }>;
+}
+
+/**
+ * Gong returns transcripts as one entry per call, each wrapping its own list of
+ * monologues under `transcript` — the monologues do not carry the call ID.
+ */
+export interface GongCallTranscript {
+  callId: string;
+  transcript: GongMonologue[];
 }
 
 export interface GongHighlight {
@@ -222,14 +231,13 @@ export class GongClient {
     };
   }
 
-  async retrieveTranscripts(callIds: string[]): Promise<GongTranscript[]> {
-    const response = await this.request<{ callTranscripts?: GongTranscript[]; transcripts?: GongTranscript[] }>(
+  async retrieveTranscripts(callIds: string[]): Promise<GongCallTranscript[]> {
+    const response = await this.request<{ callTranscripts?: GongCallTranscript[] }>(
       "POST",
       "/calls/transcript",
       { body: { filter: { callIds } } },
     );
-    // Gong has used both keys for this payload; accept either.
-    return response.callTranscripts ?? response.transcripts ?? [];
+    return response.callTranscripts ?? [];
   }
 
   async getCallHighlights(callId: string): Promise<GongCallHighlights> {
