@@ -14,7 +14,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import type { AuthInfo } from "@modelcontextprotocol/server";
 
 import { gongClientFromEnv } from "../src/gong-client.js";
-import { type AccessPayload, SCOPE, secretsMatch, verifyArtifact } from "../src/oauth.js";
+import { type AccessPayload, SCOPE, masterSecret, secretsMatch, verifyArtifact } from "../src/oauth.js";
 import { registerGongTools } from "../src/tools.js";
 
 const handler = createMcpHandler(
@@ -41,8 +41,10 @@ const handler = createMcpHandler(
  * signed either.
  */
 async function verifyToken(_req: Request, bearerToken?: string): Promise<AuthInfo | undefined> {
-  const master = process.env.MCP_AUTH_TOKEN;
-  if (!master) {
+  let master: string;
+  try {
+    master = masterSecret();
+  } catch {
     console.error(
       "MCP_AUTH_TOKEN is not set — refusing every request. Set it in the Vercel " +
         "project's environment variables and redeploy.",

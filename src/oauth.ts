@@ -70,6 +70,24 @@ export class OAuthNotConfiguredError extends Error {
 }
 
 /**
+ * Reads a secret from the environment, ignoring surrounding whitespace.
+ *
+ * Secrets get pasted into dashboards, and a trailing newline is both invisible
+ * and fatal to an exact comparison. Trimming here means every consumer agrees
+ * on the same value.
+ */
+function envSecret(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  return value ? value : undefined;
+}
+
+export function masterSecret(): string {
+  const master = envSecret("MCP_AUTH_TOKEN");
+  if (!master) throw new OAuthNotConfiguredError();
+  return master;
+}
+
+/**
  * Derives the artifact-signing key from the master secret.
  *
  * The raw `MCP_AUTH_TOKEN` is a bearer credential in its own right, so it is
@@ -78,16 +96,57 @@ export class OAuthNotConfiguredError extends Error {
  * issued client, code and access token, which is the desired behaviour.
  */
 function signingKey(): Buffer {
-  const master = process.env.MCP_AUTH_TOKEN;
-  if (!master) throw new OAuthNotConfiguredError();
-  return createHmac("sha256", master).update("gong-mcp/oauth-artifact-signing/v1").digest();
+  return createHmac("sha256", masterSecret()).update("gong-mcp/oauth-artifact-signing/v1").digest();
 }
 
 /** The password that approves an authorization request on the consent screen. */
 export function consentPassword(): string {
-  const password = process.env.MCP_LOGIN_PASSWORD || process.env.MCP_AUTH_TOKEN;
-  if (!password) throw new OAuthNotConfiguredError();
-  return password;
+  return envSecret("MCP_LOGIN_PASSWORD") ?? masterSecret();
+}
+
+/**
+ * Describes which secret the consent screen is checking against, for the
+ * server logs only.
+ *
+ * A rejected password is otherwise indistinguishable from a misconfiguration,
+ * and the two have completely different fixes. Fingerprints are truncated
+ * digests and go only to the deployment's private logs — never to a response,
+ * since `MCP_LOGIN_PASSWORD` may be low-entropy enough to attack offline.
+ */
+export function describeConsentSecret(submitted: string): string {
+  const fingerprint = (value: string) =>
+    createHash("sha256").update(value, "utf8").digest("hex").slice(0, 8);
+
+  const loginPassword = process.env.MCP_LOGIN_PASSWORD;
+  const master = process.env.MCP_AUTH_TOKEN;
+  const source = envSecret("MCP_LOGIN_PASSWORD") ? "MCP_LOGIN_PASSWORD" : "MCP_AUTH_TOKEN";
+  const raw = source === "MCP_LOGIN_PASSWORD" ? loginPassword : master;
+  const expected = consentPassword();
+
+  const notes: string[] = [];
+  if (envSecret("MCP_LOGIN_PASSWORD")) {
+    notes.push(
+      "MCP_LOGIN_PASSWORD is set, so it — not MCP_AUTH_TOKEN — is the consent password.",
+    );
+  }
+  if (raw && raw !== raw.trim()) {
+    notes.push(`${source} has surrounding whitespace in the environment; it is being trimmed before comparison.`);
+  }
+  if (submitted !== submitted.trim()) {
+    notes.push("The submitted value had surrounding whitespace; it is being trimmed before comparison.");
+  }
+  if (submitted.trim().length !== expected.length) {
+    notes.push(
+      `Length mismatch: expected ${expected.length} characters, received ${submitted.trim().length}.`,
+    );
+  }
+
+  return (
+    `Consent password rejected. Checking against ${source} ` +
+    `(fingerprint ${fingerprint(expected)}, length ${expected.length}); ` +
+    `received fingerprint ${fingerprint(submitted.trim())}, length ${submitted.trim().length}.` +
+    (notes.length > 0 ? ` ${notes.join(" ")}` : "")
+  );
 }
 
 export function secretsMatch(a: string, b: string): boolean {
