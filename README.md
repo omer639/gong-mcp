@@ -89,6 +89,7 @@ In the Vercel project, under **Settings → Environment Variables**, add all thr
 | `GONG_ACCESS_KEY` | Your Gong access key |
 | `GONG_ACCESS_SECRET` | Your Gong access secret |
 | `MCP_AUTH_TOKEN` | A secret you generate: `openssl rand -hex 32` |
+| `MCP_LOGIN_PASSWORD` | Optional. The password for the OAuth consent screen; defaults to `MCP_AUTH_TOKEN` |
 
 **`MCP_AUTH_TOKEN` is not optional.** The Gong credentials live in the function's environment, so anyone who can reach the URL can spend them and read your entire call library — and a deployment URL is not a secret. The endpoint requires this token as a bearer credential on every request, and **refuses all requests while the variable is unset**, so a misconfiguration fails closed rather than exposing your calls.
 
@@ -119,7 +120,30 @@ Cursor, in `.cursor/mcp.json`:
 }
 ```
 
-For claude.ai and the Claude mobile/desktop apps, add it as a custom connector with the same URL and an `Authorization` request header. Header support for custom connectors is a beta that is still rolling out, so if the header isn't accepted or the connector tries an OAuth flow instead, use Claude Code or Cursor for now.
+### 4. Connect claude.ai, Claude Desktop or Claude mobile
+
+These connect over OAuth only — they have no way to send a fixed header unless your organization has the request-header beta. The deployment includes a small OAuth 2.1 authorization server for exactly this, so no extra configuration is needed:
+
+1. **Admin settings → Connectors** (org-wide) or **Settings → Connectors** (just you)
+2. **Add custom connector**, URL `https://your-project.vercel.app/api/mcp`
+3. Leave OAuth Client ID and Secret **empty** — the server registers clients dynamically
+4. Click **Add**, then **Connect**
+5. A consent screen appears. Enter your `MCP_LOGIN_PASSWORD`, or `MCP_AUTH_TOKEN` if you didn't set one, and click **Approve**
+
+Access tokens last 30 days and refresh automatically, so this is a one-time step per client.
+
+Because the consent password is typed by hand — sometimes on a phone — setting `MCP_LOGIN_PASSWORD` to something memorable is worth doing. Without it you'll be pasting 64 hex characters.
+
+#### What the OAuth server does and doesn't do
+
+It implements protected-resource metadata (RFC 9728), authorization-server metadata (RFC 8414), dynamic client registration (RFC 7591), and the authorization-code grant with mandatory PKCE S256, plus refresh tokens.
+
+It is deliberately single-user. There is no user database: approving an authorization means proving you know the shared password, so every client that connects has the same full read access. Per-person identity would need a real identity provider behind the `/authorize` step.
+
+All state is carried in the artifacts themselves, each signed with a key derived from `MCP_AUTH_TOKEN`, so nothing needs storing between requests. Two consequences worth knowing:
+
+- **Rotating `MCP_AUTH_TOKEN` invalidates every issued client registration and token.** That is the revocation mechanism — there is nothing else to revoke. Every client then has to reconnect.
+- **Authorization codes are not single-use**, since enforcing that requires shared state. They expire after five minutes, and PKCE means a stolen code is useless without the client's `code_verifier`.
 
 ### Serverless constraints worth knowing
 
