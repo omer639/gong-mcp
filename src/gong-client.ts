@@ -40,6 +40,25 @@ export interface GongCallTranscript {
   transcript: GongMonologue[];
 }
 
+/**
+ * A participant on a call.
+ *
+ * `speakerId` is what links a party to the monologues in a transcript, but it is
+ * only set for parties Gong actually heard speak — invitees who never spoke, or
+ * were never matched to a voice, carry `null`.
+ */
+export interface GongParty {
+  id?: string;
+  name?: string;
+  emailAddress?: string;
+  title?: string;
+  userId?: string;
+  speakerId?: string | null;
+  /** "Internal", "External", or "Unknown". */
+  affiliation?: string;
+  methods?: string[];
+}
+
 export interface GongHighlight {
   title?: string;
   items?: Array<{ description: string; speakerId?: string; startTime?: number }>;
@@ -238,6 +257,30 @@ export class GongClient {
       { body: { filter: { callIds } } },
     );
     return response.callTranscripts ?? [];
+  }
+
+  /**
+   * Participants for the given calls, keyed by call ID.
+   *
+   * Transcripts identify speakers only by an opaque `speakerId`, so resolving
+   * names needs this second endpoint. One request covers every requested call.
+   */
+  async getCallParties(callIds: string[]): Promise<Map<string, GongParty[]>> {
+    const response = await this.request<{
+      calls?: Array<{ metaData?: { id?: string }; parties?: GongParty[] }>;
+    }>("POST", "/calls/extensive", {
+      body: {
+        filter: { callIds },
+        contentSelector: { exposedFields: { parties: true } },
+      },
+    });
+
+    const byCall = new Map<string, GongParty[]>();
+    for (const call of response.calls ?? []) {
+      const id = call.metaData?.id;
+      if (id) byCall.set(id, call.parties ?? []);
+    }
+    return byCall;
   }
 
   async getCallHighlights(callId: string): Promise<GongCallHighlights> {

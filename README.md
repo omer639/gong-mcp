@@ -16,7 +16,7 @@ Both register the same tools from `src/tools.ts` against the same client in `src
 | Tool | Description |
 |---|---|
 | `list_calls` | Lists calls most recent first. Defaults to the last 90 days. Optional `fromDateTime`, `toDateTime`, `limit`. Follows Gong's pagination cursor and reports when a result set was truncated. |
-| `retrieve_transcripts` | Transcripts for up to 20 call IDs, as speaker-labeled timestamped lines (`format: "text"`, the default) or Gong's raw per-sentence JSON (`format: "json"`). |
+| `retrieve_transcripts` | Transcripts for up to 20 call IDs, as timestamped lines labeled with participant names, under topic headings, preceded by a roster of speakers with their affiliation and title (`format: "text"`, the default) — or Gong's raw per-sentence JSON (`format: "json"`). Set `resolveSpeakers: false` to skip the name lookup and show raw speaker IDs. |
 | `get_call_highlights` | Gong's AI-generated brief, key points, outcome and outline for one call. Highlights can take several hours after a call to become available. |
 
 ## Prerequisites
@@ -128,6 +128,8 @@ These shape how the tools behave, and why some of them refuse work rather than f
 - **Response bodies are capped at 4.5 MB.** Exceeding it produces a `413` with no usable error, so tool results are refused above ~2 MB with a message telling you to narrow the request. Transcript output is compact by default for the same reason.
 - **`maxDuration` is 120s** in `vercel.json` (the platform allows up to 300s). Gong's cursor pages are sequential, so `list_calls` stops after 10 pages (1000 calls) and flags the result `truncated` with a note — narrow the date range for a complete, correctly ordered window.
 - **Every request is stateless.** A fresh server instance is built per invocation; nothing is cached between them.
+
+Transcripts identify speakers only by an opaque numeric ID, so `retrieve_transcripts` resolves names through a second `/v2/calls/extensive` request — one per tool call, however many call IDs it covers. That lookup is supplementary: if it fails (a missing scope, say), the transcript is still returned with raw speaker IDs rather than erroring.
 
 ## Development
 

@@ -1,7 +1,12 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
-import { GongApiError, type GongCallTranscript, type GongClient } from "./gong-client.js";
+import {
+  GongApiError,
+  type GongCallTranscript,
+  type GongClient,
+  type GongParty,
+} from "./gong-client.js";
 
 /**
  * Ceiling on the text of a single tool result.
@@ -55,13 +60,54 @@ function timestamp(ms: number): string {
 }
 
 /**
+ * Maps `speakerId` to a display name for one call.
+ *
+ * Names are used bare on transcript lines to keep them short. Where two parties
+ * share a name, affiliation is appended so the lines stay unambiguous.
+ */
+function buildSpeakerNames(parties: GongParty[]): Map<string, string> {
+  const speaking = parties.filter(
+    (party): party is GongParty & { speakerId: string } =>
+      typeof party.speakerId === "string" && party.speakerId.length > 0 && !!party.name?.trim(),
+  );
+
+  const nameCounts = new Map<string, number>();
+  for (const party of speaking) {
+    const name = party.name!.trim();
+    nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+  }
+
+  const names = new Map<string, string>();
+  for (const party of speaking) {
+    const name = party.name!.trim();
+    const ambiguous = (nameCounts.get(name) ?? 0) > 1;
+    names.set(party.speakerId, ambiguous && party.affiliation ? `${name} (${party.affiliation})` : name);
+  }
+  return names;
+}
+
+/** One-line roster giving each speaker's affiliation and title once, up front. */
+function formatRoster(parties: GongParty[]): string | undefined {
+  const entries = parties
+    .filter((party) => typeof party.speakerId === "string" && party.speakerId.length > 0 && party.name?.trim())
+    .map((party) => {
+      const qualifiers = [party.affiliation, party.title].filter(Boolean);
+      return qualifiers.length > 0 ? `${party.name!.trim()} (${qualifiers.join(", ")})` : party.name!.trim();
+    });
+  return entries.length > 0 ? `Speakers: ${entries.join(" · ")}` : undefined;
+}
+
+/**
  * Renders transcripts as speaker-labeled lines.
  *
  * Gong's transcript JSON is one object per sentence, which costs several times
  * the bytes of the text it carries. Reading is the point of this tool, so this
  * is the default shape; `format: "json"` returns the raw payload.
  */
-function formatTranscripts(callTranscripts: GongCallTranscript[]): string {
+function formatTranscripts(
+  callTranscripts: GongCallTranscript[],
+  partiesByCall: Map<string, GongParty[]>,
+): string {
   if (callTranscripts.length === 0) {
     return "No transcripts returned. The calls may not be transcribed yet, or the API key may lack access to them.";
   }
@@ -69,7 +115,12 @@ function formatTranscripts(callTranscripts: GongCallTranscript[]): string {
   const sections: string[] = [];
   for (const { callId, transcript } of callTranscripts) {
     const monologues = transcript ?? [];
+    const parties = partiesByCall.get(callId) ?? [];
+    const speakerNames = buildSpeakerNames(parties);
     const lines = [`## Call ${callId}`];
+
+    const roster = formatRoster(parties);
+    if (roster) lines.push(roster);
 
     if (monologues.length === 0) {
       lines.push("(no transcript content — the call may not be transcribed yet)");
@@ -86,7 +137,8 @@ function formatTranscripts(callTranscripts: GongCallTranscript[]): string {
         lines.push(`\n### ${monologue.topic}`);
       }
 
-      const speaker = monologue.speakerId ?? "unknown";
+      // Fall back to the raw ID for a speaker no party matched.
+      const speaker = speakerNames.get(monologue.speakerId) ?? monologue.speakerId ?? "unknown";
       const text = sentences.map((sentence) => sentence.text).join(" ");
       lines.push(`[${timestamp(sentences[0].start)}] ${speaker}: ${text}`);
     }
@@ -146,7 +198,7 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
     {
       title: "Retrieve Gong call transcripts",
       description:
-        "Retrieve transcripts for specific call IDs, as speaker-labeled timestamped lines. " +
+        "Retrieve transcripts for specific call IDs, as timestamped lines labeled with participant names. " +
         `Accepts up to ${MAX_CALL_IDS} call IDs per request; transcripts are large, so request a few at a time.`,
       inputSchema: z.object({
         callIds: z
@@ -160,16 +212,42 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
           .describe(
             "'text' (default) for readable speaker-labeled lines; 'json' for Gong's raw per-sentence payload.",
           ),
+        resolveSpeakers: z
+          .boolean()
+          .default(true)
+          .describe(
+            "Look up participant names so speakers are named rather than shown as opaque IDs. " +
+              "Costs one extra API request per call to this tool; set false to skip it.",
+          ),
       }),
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async ({ callIds, format }) => {
+    async ({ callIds, format, resolveSpeakers }) => {
       try {
-        const callTranscripts = await getClient().retrieveTranscripts(callIds);
+        const client = getClient();
+
+        // Speaker names come from a second endpoint. It is supplementary, so a
+        // failure there (missing scope, say) degrades to raw speaker IDs rather
+        // than losing the transcript. Both requests go out together.
+        const [callTranscripts, partiesByCall] = await Promise.all([
+          client.retrieveTranscripts(callIds),
+          resolveSpeakers
+            ? client.getCallParties(callIds).catch((error): Map<string, GongParty[]> => {
+                console.error(`Could not resolve speaker names, falling back to speaker IDs: ${error}`);
+                return new Map();
+              })
+            : Promise.resolve(new Map<string, GongParty[]>()),
+        ]);
+
         const narrowingHint = "Request fewer call IDs per call.";
-        return format === "json"
-          ? jsonResult({ callTranscripts }, narrowingHint)
-          : guardSize(formatTranscripts(callTranscripts), narrowingHint);
+        if (format === "json") {
+          const parties = Object.fromEntries(partiesByCall);
+          return jsonResult(
+            resolveSpeakers ? { callTranscripts, parties } : { callTranscripts },
+            narrowingHint,
+          );
+        }
+        return guardSize(formatTranscripts(callTranscripts, partiesByCall), narrowingHint);
       } catch (error) {
         return errorResult(describeError(error));
       }
