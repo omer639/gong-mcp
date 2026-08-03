@@ -17,6 +17,7 @@ import {
   SCOPE,
   consentPage,
   consentPassword,
+  describeConsentSecret,
   isAllowedRedirectUri,
   mintCode,
   oauthError,
@@ -163,7 +164,12 @@ export async function POST(request: Request): Promise<Response> {
     throw error;
   }
 
-  if (typeof submitted !== "string" || submitted === "" || !secretsMatch(submitted, expected)) {
+  const candidate = typeof submitted === "string" ? submitted.trim() : "";
+  if (candidate === "" || !secretsMatch(candidate, expected)) {
+    // Goes to the deployment's private logs: from the outside a rejected
+    // password and a misconfigured one look identical, and they are fixed
+    // differently.
+    if (candidate !== "") console.error(describeConsentSecret(candidate));
     // Re-render rather than redirect: a wrong password is the user's problem to
     // fix here, and telling the client would leak that someone tried.
     return consentPage({
