@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Gong MCP Server</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #18181b;
+        --muted: #71717a;
+        --bg: #fafafa;
+        --code-bg: #f4f4f5;
+        --border: #e4e4e7;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #f4f4f5;
+          --muted: #a1a1aa;
+          --bg: #09090b;
+          --code-bg: #18181b;
+          --border: #27272a;
+        }
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 2rem 1.25rem;
+        background: var(--bg);
+        color: var(--fg);
+        font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main {
+        max-width: 32rem;
+      }
+      h1 {
+        font-size: 1.25rem;
+        margin: 0 0 0.5rem;
+      }
+      p {
+        margin: 0 0 1rem;
+        color: var(--muted);
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.875em;
+        background: var(--code-bg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 0.15em 0.4em;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Gong MCP Server</h1>
+      <p>
+        This deployment serves a Model Context Protocol endpoint at
+        <code>/api/mcp</code> over Streamable HTTP. It requires a bearer token and
+        is not usable from a browser.
+      </p>
+      <p>Point an MCP client at that path to use it.</p>
+    </main>
+  </body>
+</html>
