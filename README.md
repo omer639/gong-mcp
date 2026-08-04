@@ -90,6 +90,7 @@ In the Vercel project, under **Settings → Environment Variables**, add all thr
 | `GONG_ACCESS_SECRET` | Your Gong access secret |
 | `MCP_AUTH_TOKEN` | A secret you generate: `openssl rand -hex 32` |
 | `MCP_LOGIN_PASSWORD` | Optional. The password for the OAuth consent screen; defaults to `MCP_AUTH_TOKEN` |
+| `GONG_API_BASE_URL` | Optional. Defaults to `https://api.gong.io`. Set this if your Gong account requires its company-specific host, e.g. `https://us-18795.api.gong.io` |
 
 **`MCP_AUTH_TOKEN` is not optional.** The Gong credentials live in the function's environment, so anyone who can reach the URL can spend them and read your entire call library — and a deployment URL is not a secret. The endpoint requires this token as a bearer credential on every request, and **refuses all requests while the variable is unset**, so a misconfiguration fails closed rather than exposing your calls.
 
