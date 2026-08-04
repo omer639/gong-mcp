@@ -1,4 +1,19 @@
-const GONG_API_URL = "https://api.gong.io/v2";
+/**
+ * Gong's global API host, which routes to the right cell for the credentials
+ * presented. Some accounts are also reachable at a company-specific host such
+ * as `https://us-18795.api.gong.io`; both accept the same keys, but the base URL
+ * is configurable via GONG_API_BASE_URL for accounts where the cell host is
+ * required, or if Gong's dashboard shows a different one.
+ */
+const DEFAULT_GONG_API_URL = "https://api.gong.io/v2";
+
+function gongApiUrl(): string {
+  const configured = process.env.GONG_API_BASE_URL?.trim();
+  if (!configured) return DEFAULT_GONG_API_URL;
+  const withoutTrailingSlash = configured.replace(/\/+$/, "");
+  // Accept either the bare host or a URL that already includes the /v2 prefix.
+  return /\/v\d+$/.test(withoutTrailingSlash) ? withoutTrailingSlash : `${withoutTrailingSlash}/v2`;
+}
 
 /** Gong returns at most 100 records per request and pages with an opaque cursor. */
 const GONG_PAGE_SIZE = 100;
@@ -91,6 +106,33 @@ interface GongRecords {
   cursor?: string;
 }
 
+/**
+ * Describes the credentials this deployment is actually using, for the server
+ * logs only.
+ *
+ * Enough shape to spot a truncated secret or a key that was changed without
+ * redeploying, without writing either value out in full. Never returned in a
+ * response.
+ */
+function describeDeployedCredentials(origin: string): string {
+  const shape = (name: string) => {
+    const raw = process.env[name];
+    if (!raw) return `${name}=<not set>`;
+    const value = raw.trim();
+    const edges = value.length > 12 ? `${value.slice(0, 4)}…${value.slice(-4)}` : "<too short to mask>";
+    const whitespace = raw !== value ? ", had surrounding whitespace" : "";
+    return `${name}=${edges} (length ${value.length}${whitespace})`;
+  };
+
+  return (
+    `Gong rejected these credentials. Host ${origin}. ` +
+    `${shape("GONG_ACCESS_KEY")}; ${shape("GONG_ACCESS_SECRET")}. ` +
+    "A Gong access key is 32 characters and the secret is a JWT of about 180. " +
+    "If either looks short it was truncated on paste; if they are not the values you expect, " +
+    "the deployment predates the change — redeploy after editing environment variables."
+  );
+}
+
 export class GongApiError extends Error {
   constructor(
     message: string,
@@ -129,7 +171,7 @@ export class GongClient {
     path: string,
     { params, body }: { params?: Record<string, string | undefined>; body?: unknown } = {},
   ): Promise<T> {
-    const url = new URL(`${GONG_API_URL}${path}`);
+    const url = new URL(`${gongApiUrl()}${path}`);
     for (const [key, value] of Object.entries(params ?? {})) {
       if (value !== undefined) url.searchParams.set(key, value);
     }
@@ -159,6 +201,13 @@ export class GongClient {
 
     if (!response.ok) {
       const text = await response.text().catch(() => "");
+      if (response.status === 401 || response.status === 403) {
+        // To the deployment's private logs. A rejected key is indistinguishable
+        // from a stale or truncated one from the outside, and the usual causes —
+        // changing the variable without redeploying, or pasting only part of the
+        // secret — are both visible in the shape of what actually got deployed.
+        console.error(describeDeployedCredentials(url.origin));
+      }
       const hint =
         response.status === 401 || response.status === 403
           ? " Check that GONG_ACCESS_KEY and GONG_ACCESS_SECRET are correct and that the key has the required scopes."
