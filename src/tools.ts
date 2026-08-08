@@ -183,11 +183,52 @@ interface TranscriptMatch {
   title?: string;
   url?: string;
   started?: string;
+  /** Whether the call had an external participant; "unknown" when no party data was available. */
+  affiliation?: CallAffiliation;
   /** Which of the query phrases appear anywhere in this call. */
   matchedPhrases: string[];
   /** Total transcript lines that hit at least one phrase (before snippet trimming). */
   matchingLines: number;
   snippets: TranscriptSnippet[];
+}
+
+type CallAffiliation = "external" | "internal" | "unknown";
+
+/**
+ * Classifies a call by participant affiliation.
+ *
+ * A call counts as "external" (a customer/prospect call) if any party is
+ * external, since a typical customer call also has internal reps on it. It is
+ * "internal" only when parties are present and none are external. Missing party
+ * data — a failed lookup, or a call Gong never tagged — is "unknown" rather than
+ * silently assumed one way or the other.
+ */
+function classifyAffiliation(parties: GongParty[] | undefined): CallAffiliation {
+  if (!parties || parties.length === 0) return "unknown";
+  if (parties.some((party) => party.affiliation === "External")) return "external";
+  if (parties.some((party) => party.affiliation === "Internal")) return "internal";
+  return "unknown";
+}
+
+/**
+ * Fills in per-match party data once it has been fetched: the call's affiliation
+ * always, and resolved speaker names on each snippet when `resolveNames` is set.
+ */
+function annotateMatches(
+  matches: TranscriptMatch[],
+  partiesByCall: Map<string, GongParty[]>,
+  resolveNames: boolean,
+): void {
+  for (const match of matches) {
+    const parties = partiesByCall.get(match.callId) ?? [];
+    match.affiliation = classifyAffiliation(parties.length > 0 ? parties : undefined);
+    if (resolveNames) {
+      const names = buildSpeakerNames(parties);
+      for (const snippet of match.snippets) {
+        snippet.speaker = names.get(snippet.speakerId) ?? snippet.speakerId;
+      }
+    }
+  }
 }
 
 /**
@@ -386,6 +427,8 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         '"which calls asked about the Telegram data API?" or "who reported bug X?". ' +
         "Returns the matching calls, ranked by relevance, each with the exact transcript snippets, the speaker, " +
         "and a timestamp — then feed the call IDs to retrieve_transcripts for the full context.\n\n" +
+        "By default it searches only customer/prospect calls (those with an external participant) and skips " +
+        "internal team calls; set participants to widen or invert that.\n\n" +
         "How it works: it fetches and scans the transcripts of recent calls in the date range, so it is much " +
         "heavier than list_calls. Keep the date range tight and the query phrases specific. Matching is " +
         "case-insensitive substring matching, so include the variants a speaker might use " +
@@ -404,6 +447,15 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
           .describe(
             "'any' (default) matches a call that mentions at least one phrase; 'all' requires every phrase " +
               "to appear somewhere in the same call.",
+          ),
+        participants: z
+          .enum(["external", "internal", "all"])
+          .default("external")
+          .describe(
+            "Which calls to search by participant affiliation. 'external' (default) restricts to customer/" +
+              "prospect calls — those with at least one external participant — so internal team calls are " +
+              "skipped; 'internal' keeps only calls with no external participant; 'all' searches everything. " +
+              "Calls whose participant affiliation Gong did not record are reported separately, not silently dropped.",
           ),
         fromDateTime: z
           .string()
@@ -441,23 +493,96 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
       }),
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async ({ phrases, matchMode, fromDateTime, toDateTime, maxCalls, snippetsPerCall, resolveSpeakers }) => {
+    async ({
+      phrases,
+      matchMode,
+      participants,
+      fromDateTime,
+      toDateTime,
+      maxCalls,
+      snippetsPerCall,
+      resolveSpeakers,
+    }) => {
       try {
         const client = getClient();
 
-        // Which calls to scan: the most recent in the window, capped so the
+        // Which calls to consider: the most recent in the window, capped so the
         // transcript fetches that follow stay within one function's budget.
         const listed = await client.listCalls({ fromDateTime, toDateTime, limit: maxCalls });
         const candidates = listed.calls;
         if (candidates.length === 0) {
           return jsonResult(
-            { query: { phrases, matchMode }, scanned: 0, matchCount: 0, matches: [] },
+            { query: { phrases, matchMode, participants }, scanned: 0, matchCount: 0, matches: [] },
             "Widen the date range.",
           );
         }
 
         const metaById = new Map(candidates.map((call) => [call.id, call]));
-        const transcripts = await client.retrieveTranscriptsForCalls(candidates.map((call) => call.id));
+        const notes: string[] = [];
+
+        // Participant affiliation lives on a separate endpoint, so filtering by
+        // it means fetching parties before transcripts. That is a net saving:
+        // excluded calls never have their (much larger) transcripts fetched, and
+        // the parties are reused for speaker names, so no second lookup is made.
+        let candidateParties = new Map<string, GongParty[]>();
+        let filterActive = participants !== "all";
+        if (filterActive) {
+          candidateParties = await client
+            .getCallParties(candidates.map((call) => call.id))
+            .catch((error): Map<string, GongParty[]> => {
+              console.error(`Could not fetch participant affiliation, skipping the filter: ${error}`);
+              return new Map();
+            });
+          if (candidateParties.size === 0) {
+            // The lookup failed wholesale; fall back to searching everything
+            // rather than silently returning nothing.
+            filterActive = false;
+            notes.push(
+              "Could not determine participant affiliation (the lookup failed), so the participants " +
+                "filter was not applied and all calls in the window were searched.",
+            );
+          }
+        }
+
+        let toScan = candidates;
+        let excludedByFilter = 0;
+        let undetermined = 0;
+        if (filterActive) {
+          toScan = candidates.filter((call) => {
+            const affiliation = classifyAffiliation(candidateParties.get(call.id));
+            if (affiliation === "unknown") {
+              undetermined += 1;
+              return false;
+            }
+            const keep = participants === "external" ? affiliation === "external" : affiliation === "internal";
+            if (!keep) excludedByFilter += 1;
+            return keep;
+          });
+          const skipped = participants === "external" ? "internal" : "external";
+          notes.push(
+            `participants='${participants}': kept ${toScan.length} of ${candidates.length} calls, ` +
+              `excluding ${excludedByFilter} ${skipped} call(s)` +
+              (undetermined > 0
+                ? ` and ${undetermined} whose affiliation Gong did not record (use participants='all' to include those)`
+                : "") +
+              ".",
+          );
+        }
+
+        if (toScan.length === 0) {
+          return jsonResult(
+            {
+              query: { phrases, matchMode, participants },
+              scanned: 0,
+              matchCount: 0,
+              ...(notes.length > 0 ? { note: notes.join(" ") } : {}),
+              matches: [],
+            },
+            "Set participants='all' to include internal or unclassified calls, or widen the date range.",
+          );
+        }
+
+        const transcripts = await client.retrieveTranscriptsForCalls(toScan.map((call) => call.id));
 
         const loweredPhrases = phrases.map((phrase) => ({
           original: phrase,
@@ -475,20 +600,21 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
           if (match) matches.push(match);
         }
 
-        // Resolve speaker names only for the calls that matched — far fewer than
-        // the scanned set — and degrade to raw IDs if the lookup fails.
-        if (resolveSpeakers && matches.length > 0) {
-          const partiesByCall = await client
-            .getCallParties(matches.map((match) => match.callId))
-            .catch((error): Map<string, GongParty[]> => {
-              console.error(`Could not resolve speaker names, falling back to speaker IDs: ${error}`);
-              return new Map();
-            });
-          for (const match of matches) {
-            const names = buildSpeakerNames(partiesByCall.get(match.callId) ?? []);
-            for (const snippet of match.snippets) {
-              snippet.speaker = names.get(snippet.speakerId) ?? snippet.speakerId;
-            }
+        // Attach affiliation and speaker names. When the filter ran we already
+        // hold parties for every candidate; otherwise fetch them just for the
+        // matched calls, and only when name resolution was requested.
+        if (matches.length > 0) {
+          let partiesByCall = candidateParties;
+          if (partiesByCall.size === 0 && resolveSpeakers) {
+            partiesByCall = await client
+              .getCallParties(matches.map((match) => match.callId))
+              .catch((error): Map<string, GongParty[]> => {
+                console.error(`Could not resolve speaker names, falling back to speaker IDs: ${error}`);
+                return new Map();
+              });
+          }
+          if (partiesByCall.size > 0) {
+            annotateMatches(matches, partiesByCall, resolveSpeakers);
           }
         }
 
@@ -500,10 +626,9 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
             (b.started ?? "").localeCompare(a.started ?? ""),
         );
 
-        const notes: string[] = [];
         if (listed.truncated || candidates.length >= maxCalls) {
           notes.push(
-            `Scanned the ${candidates.length} most recent calls in the range` +
+            `Considered the ${candidates.length} most recent calls in the range` +
               `${listed.totalRecords != null ? ` of ${listed.totalRecords} total` : ""}. ` +
               "Calls outside that window were not searched — narrow the date range, or raise maxCalls, " +
               "to cover the rest.",
@@ -512,7 +637,7 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
 
         return jsonResult(
           {
-            query: { phrases, matchMode },
+            query: { phrases, matchMode, participants },
             scanned: transcripts.length,
             matchCount: matches.length,
             ...(notes.length > 0 ? { note: notes.join(" ") } : {}),
