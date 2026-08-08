@@ -18,6 +18,18 @@ Both register the same tools from `src/tools.ts` against the same client in `src
 | `list_calls` | Lists calls most recent first. Defaults to the last 90 days. Optional `fromDateTime`, `toDateTime`, `limit`. Follows Gong's pagination cursor and reports when a result set was truncated. |
 | `retrieve_transcripts` | Transcripts for up to 20 call IDs, as timestamped lines labeled with participant names, under topic headings, preceded by a roster of speakers with their affiliation and title (`format: "text"`, the default) — or Gong's raw per-sentence JSON (`format: "json"`). Set `resolveSpeakers: false` to skip the name lookup and show raw speaker IDs. |
 | `get_call_highlights` | Gong's AI-generated brief, key points, outcome and outline for one call. Highlights can take several hours after a call to become available. |
+| `search_call_transcripts` | Finds calls whose **transcript** mentions given words or phrases — the content search Gong's own API does not offer. Give `phrases` (e.g. `["Telegram data API", "Telegram API"]`) and, optionally, `matchMode` (`"any"`/`"all"`), a date range, `maxCalls`, and `snippetsPerCall`. Returns the matching calls ranked by relevance, each with the exact snippets, speaker, and timestamp — feed the call IDs to `retrieve_transcripts` for full context. See [Searching transcripts by content](#searching-transcripts-by-content). |
+
+### Searching transcripts by content
+
+Gong's public API filters calls by title, date and participants, but not by what was said. `search_call_transcripts` closes that gap the only way the official API allows: it lists the recent calls in a date range, fetches their transcripts, and matches your phrases against the spoken lines — case-insensitive substring matching, so pass the variants a speaker might use.
+
+Because it fetches a transcript for every call it scans, it is much heavier than `list_calls`. Two things keep it inside the serverless budget:
+
+- It scans only the **most recent `maxCalls`** in the range (default 120, hard cap 500) and notes when calls outside that window went unsearched. Narrow the date range for full coverage of a busy period rather than raising `maxCalls`.
+- It returns only the matching snippets, not whole transcripts, so the result stays well under the response-size limit.
+
+If your team searches the **same** recurring keywords (a product area, a competitor name), consider configuring a **Tracker** in Gong instead — Gong tags calls automatically when a tracker's phrases are spoken, which is far cheaper to query than scanning transcripts. Trackers must be set up ahead of time in Gong and can't answer ad-hoc questions, which is exactly what this tool is for.
 
 ## Prerequisites
 
