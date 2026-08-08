@@ -18,7 +18,7 @@ Both register the same tools from `src/tools.ts` against the same client in `src
 | `list_calls` | Lists calls most recent first. Defaults to the last 90 days. Optional `fromDateTime`, `toDateTime`, `limit`. Follows Gong's pagination cursor and reports when a result set was truncated. |
 | `retrieve_transcripts` | Transcripts for up to 20 call IDs, as timestamped lines labeled with participant names, under topic headings, preceded by a roster of speakers with their affiliation and title (`format: "text"`, the default) — or Gong's raw per-sentence JSON (`format: "json"`). Set `resolveSpeakers: false` to skip the name lookup and show raw speaker IDs. |
 | `get_call_highlights` | Gong's AI-generated brief, key points, outcome and outline for one call. Highlights can take several hours after a call to become available. |
-| `search_call_transcripts` | Finds calls whose **transcript** mentions given words or phrases — the content search Gong's own API does not offer. Give `phrases` (e.g. `["Telegram data API", "Telegram API"]`) and, optionally, `matchMode` (`"any"`/`"all"`), `participants` (`"external"`/`"internal"`/`"all"`), a date range, `maxCalls`, and `snippetsPerCall`. Returns the matching calls ranked by relevance, each with its participant affiliation, the exact snippets, speaker, and timestamp — feed the call IDs to `retrieve_transcripts` for full context. See [Searching transcripts by content](#searching-transcripts-by-content). |
+| `search_call_transcripts` | Finds calls whose **transcript** mentions given words or phrases — the content search Gong's own API does not offer. Give `phrases` (e.g. `["Telegram data API", "Telegram API"]`) and, optionally, `matchMode` (`"any"`/`"all"`), `participants` (`"external"`/`"internal"`/`"all"`), `mentionedBy`/`raisedBy` (`"external"`/`"internal"`/`"anyone"`), `contextLines`, a date range, `maxCalls`, and `snippetsPerCall`. Returns the matching calls ranked by relevance, each with its participant affiliation, who first raised the topic, and the matching lines with surrounding context, speaker names, per-line affiliation and timestamps — feed the call IDs to `retrieve_transcripts` for full context. See [Searching transcripts by content](#searching-transcripts-by-content). |
 
 ### Searching transcripts by content
 
@@ -31,6 +31,14 @@ Gong's public API filters calls by title, date and participants, but not by what
 - `"all"` — no filter.
 
 Calls Gong never tagged with an affiliation are reported in the result's `note`, not silently dropped, so you can rerun with `participants: "all"` if that count is high. When the filter is active, the affiliation lookup happens **before** transcripts are fetched, so excluded calls never incur a transcript fetch — filtering makes the search cheaper, not more expensive.
+
+**Who said it — "we pitched" vs. "they asked".** Two more options work at the line level, distinguishing a topic being *mentioned* from *who* mentioned it:
+
+- `mentionedBy` (`"external"` / `"internal"` / `"anyone"`, default `"anyone"`) — count a line as a match only when the speaker is on that side. `mentionedBy: "external"` surfaces what the *customer* said ("did they ask about X?"); `"internal"` surfaces what your team said ("did we bring up X?").
+- `raisedBy` (same values, default `"anyone"`) — keep only calls where the **first** mention of the topic came from that side. `raisedBy: "external"` is customer-initiated demand — they brought it up before you did — versus `"internal"`, where your team introduced it. Every match reports `topicRaisedBy` regardless, so you always see who mentioned it first.
+- `contextLines` (default 1, max 6) — transcript turns to include on each side of every matching line, so the surrounding exchange is visible.
+
+These are structural signals — speaker affiliation, first-mention order, question vs. statement is up to the reader — not a semantic judgment of intent. Each snippet is returned as an ordered run of turns, with the matching line flagged (`isMatch`) and every turn carrying its speaker's `affiliation`, so an LLM caller can read the exchange and make the finer "pitched vs. asked" call itself. Lines Gong could not attribute to a speaker are not counted by `mentionedBy`/`raisedBy`, and the result `note` says when those filters are active.
 
 Because it fetches a transcript for every call it scans, it is much heavier than `list_calls`. Two things keep it inside the serverless budget:
 
