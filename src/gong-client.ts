@@ -309,26 +309,71 @@ export class GongClient {
   }
 
   /**
+   * Transcripts for a potentially large set of call IDs.
+   *
+   * `retrieveTranscripts` sends every ID in one request, which is fine for the
+   * handful the read tool allows but not for a content search that scans
+   * hundreds. This chunks the IDs so no single request carries an unbounded
+   * body, and follows Gong's response cursor within each chunk in case a chunk's
+   * transcripts span more than one page.
+   */
+  async retrieveTranscriptsForCalls(
+    callIds: string[],
+    { batchSize = GONG_PAGE_SIZE }: { batchSize?: number } = {},
+  ): Promise<GongCallTranscript[]> {
+    const collected: GongCallTranscript[] = [];
+    for (let i = 0; i < callIds.length; i += batchSize) {
+      const chunk = callIds.slice(i, i + batchSize);
+      let cursor: string | undefined;
+      do {
+        const response = await this.request<{
+          callTranscripts?: GongCallTranscript[];
+          records?: GongRecords;
+        }>("POST", "/calls/transcript", {
+          body: { filter: { callIds: chunk }, ...(cursor ? { cursor } : {}) },
+        });
+        collected.push(...(response.callTranscripts ?? []));
+        cursor = response.records?.cursor;
+      } while (cursor);
+    }
+    return collected;
+  }
+
+  /**
    * Participants for the given calls, keyed by call ID.
    *
    * Transcripts identify speakers only by an opaque `speakerId`, so resolving
    * names needs this second endpoint. One request covers every requested call.
    */
   async getCallParties(callIds: string[]): Promise<Map<string, GongParty[]>> {
-    const response = await this.request<{
-      calls?: Array<{ metaData?: { id?: string }; parties?: GongParty[] }>;
-    }>("POST", "/calls/extensive", {
-      body: {
-        filter: { callIds },
-        contentSelector: { exposedFields: { parties: true } },
-      },
-    });
-
     const byCall = new Map<string, GongParty[]>();
-    for (const call of response.calls ?? []) {
-      const id = call.metaData?.id;
-      if (id) byCall.set(id, call.parties ?? []);
+
+    // Chunk so no single request carries an unbounded body, and follow Gong's
+    // cursor within each chunk: `/calls/extensive` pages at 100 records, so a
+    // chunk at the page size can still span more than one page.
+    for (let i = 0; i < callIds.length; i += GONG_PAGE_SIZE) {
+      const chunk = callIds.slice(i, i + GONG_PAGE_SIZE);
+      let cursor: string | undefined;
+      do {
+        const response = await this.request<{
+          calls?: Array<{ metaData?: { id?: string }; parties?: GongParty[] }>;
+          records?: GongRecords;
+        }>("POST", "/calls/extensive", {
+          body: {
+            filter: { callIds: chunk },
+            contentSelector: { exposedFields: { parties: true } },
+            ...(cursor ? { cursor } : {}),
+          },
+        });
+
+        for (const call of response.calls ?? []) {
+          const id = call.metaData?.id;
+          if (id) byCall.set(id, call.parties ?? []);
+        }
+        cursor = response.records?.cursor;
+      } while (cursor);
     }
+
     return byCall;
   }
 
