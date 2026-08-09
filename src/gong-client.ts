@@ -31,6 +31,8 @@ export interface GongCall {
   scheduled?: string;
   started?: string;
   duration?: number;
+  /** Gong user ID of the call owner; used as a cheap first pass for the team-access gate. */
+  primaryUserId?: string;
   direction?: string;
   system?: string;
   scope?: string;

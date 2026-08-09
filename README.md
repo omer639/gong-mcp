@@ -118,6 +118,7 @@ In the Vercel project, under **Settings → Environment Variables**, add all thr
 | `GONG_ACCESS_SECRET` | Your Gong access secret |
 | `MCP_AUTH_TOKEN` | A secret you generate: `openssl rand -hex 32` |
 | `MCP_LOGIN_PASSWORD` | Optional. The password for the OAuth consent screen; defaults to `MCP_AUTH_TOKEN` |
+| `GONG_TEAM_USER_IDS` / `GONG_TEAM_EMAILS` | Optional but **strongly recommended when serving a team.** Comma-separated roster that limits which calls the tools expose — see [Access control](#access-control). |
 | `GONG_API_BASE_URL` | Optional. Defaults to `https://api.gong.io`. Set this if your Gong account requires its company-specific host, e.g. `https://us-18795.api.gong.io` |
 
 **`MCP_AUTH_TOKEN` is not optional.** The Gong credentials live in the function's environment, so anyone who can reach the URL can spend them and read your entire call library — and a deployment URL is not a secret. The endpoint requires this token as a bearer credential on every request, and **refuses all requests while the variable is unset**, so a misconfiguration fails closed rather than exposing your calls.
@@ -173,6 +174,17 @@ All state is carried in the artifacts themselves, each signed with a key derived
 
 - **Rotating `MCP_AUTH_TOKEN` invalidates every issued client registration and token.** That is the revocation mechanism — there is nothing else to revoke. Every client then has to reconnect.
 - **Authorization codes are not single-use**, since enforcing that requires shared state. They expire after five minutes, and PKCE means a stolen code is useless without the client's `code_verifier`.
+
+### Access control
+
+A Gong API key sees **every call in the workspace** — private and internal ones included — and Gong offers no way to scope a key to a subset of calls or to a person. The OAuth layer here is also single-user: everyone who connects with the consent password is the same identity with the same full read access. So on their own, these tools would let any connected user read the entire call library.
+
+To make the server safe to hand to a team, set a **roster** — `GONG_TEAM_USER_IDS` and/or `GONG_TEAM_EMAILS` (comma-separated). When either is set, every tool enforces one rule: **a call is only exposed if a roster member actually took part in it** (as owner or participant). Calls no roster member attended — exec syncs, HR, M&A, strategy, anything private the team wasn't on — are invisible: dropped from `list_calls`, refused by `retrieve_transcripts` and `get_call_highlights`, and skipped by `search_call_transcripts` before any transcript is fetched.
+
+- **User IDs are the reliable match** (stable, and used as a free fast-path for the call owner); **emails** are easier to maintain. Set either or both.
+- It **fails closed**: if the participant lookup can't be completed, the tools refuse rather than risk exposing a call the team wasn't on.
+- This is a *positive allow-list by participation*, deliberately, rather than trying to detect which calls are "sensitive" — the `isPrivate` flag only catches calls someone explicitly marked, not the many that simply are.
+- **Limits worth knowing:** the roster can't express "rep A sees less than rep B" — everyone connected gets the same team-scoped view. And a private call a roster member *did* attend is still visible to the whole team. Per-person visibility matching each user's own Gong permissions would require per-user Gong OAuth, which this server does not implement. With the roster **unset, the gate is off** and every call the key can see is exposed — so set it before serving more than yourself.
 
 ### Serverless constraints worth knowing
 

@@ -382,6 +382,79 @@ function matchTranscript(
 }
 
 /**
+ * The team-access roster.
+ *
+ * Gong's API key sees every call in the workspace — private and internal ones
+ * included — and Gong offers no way to scope a key per user. So access is
+ * gated here instead: a call is only ever exposed if a roster member actually
+ * took part in it. Everything the team wasn't on (exec, HR, M&A, strategy)
+ * stays invisible, which is a far more robust rule than trying to detect which
+ * calls are "sensitive".
+ *
+ * Configure with GONG_TEAM_USER_IDS and/or GONG_TEAM_EMAILS (comma-separated).
+ * User IDs are the stable, reliable match; emails are easier to maintain. When
+ * neither is set the gate is inactive and every call the key can see is exposed
+ * — so a deployment that serves a whole team must set at least one.
+ */
+interface TeamRoster {
+  userIds: Set<string>;
+  emails: Set<string>;
+  configured: boolean;
+}
+
+function teamRoster(): TeamRoster {
+  const split = (value?: string) =>
+    (value ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  const userIds = new Set(split(process.env.GONG_TEAM_USER_IDS));
+  const emails = new Set(split(process.env.GONG_TEAM_EMAILS).map((email) => email.toLowerCase()));
+  return { userIds, emails, configured: userIds.size > 0 || emails.size > 0 };
+}
+
+/** True when at least one participant on the call is a roster member. */
+function partiesIncludeTeam(parties: GongParty[], roster: TeamRoster): boolean {
+  return parties.some(
+    (party) =>
+      (party.userId != null && roster.userIds.has(party.userId)) ||
+      (party.emailAddress != null && roster.emails.has(party.emailAddress.toLowerCase())),
+  );
+}
+
+/** Human-facing refusal shared by every tool when the roster blocks a call. */
+const NO_TEAM_MEMBER_MESSAGE =
+  "no CS/SDR/AE team member took part in it, so it is not accessible through this tool.";
+
+/**
+ * Filters a listed page down to calls the team took part in.
+ *
+ * Uses the call owner (`primaryUserId`) as a free first pass — most reps own
+ * their own calls — and only pays for a parties lookup on the calls that pass
+ * involves someone off the owner list. Recency order is preserved.
+ */
+async function filterCallsToTeam(
+  client: GongClient,
+  calls: GongCall[],
+  roster: TeamRoster,
+): Promise<GongCall[]> {
+  const order = new Map(calls.map((call, index) => [call.id, index]));
+  const kept: GongCall[] = [];
+  const uncertain: GongCall[] = [];
+  for (const call of calls) {
+    if (call.primaryUserId && roster.userIds.has(call.primaryUserId)) kept.push(call);
+    else uncertain.push(call);
+  }
+  if (uncertain.length > 0) {
+    const parties = await client.getCallParties(uncertain.map((call) => call.id));
+    for (const call of uncertain) {
+      if (partiesIncludeTeam(parties.get(call.id) ?? [], roster)) kept.push(call);
+    }
+  }
+  return kept.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+}
+
+/**
  * Registers the Gong tools on a server instance.
  *
  * `getClient` is called per invocation so both entrypoints — stdio and the
@@ -417,7 +490,14 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
     },
     async ({ fromDateTime, toDateTime, limit }) => {
       try {
-        const result = await getClient().listCalls({ fromDateTime, toDateTime, limit });
+        const client = getClient();
+        const roster = teamRoster();
+        const result = await client.listCalls({ fromDateTime, toDateTime, limit });
+        if (roster.configured) {
+          // Gate before returning: even a call's title can be sensitive, so
+          // calls with no team member are dropped from the listing entirely.
+          result.calls = await filterCallsToTeam(client, result.calls, roster);
+        }
         return jsonResult(result, "Narrow the date range or set a smaller limit.");
       } catch (error) {
         return errorResult(describeError(error));
@@ -457,29 +537,58 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
     async ({ callIds, format, resolveSpeakers }) => {
       try {
         const client = getClient();
+        const roster = teamRoster();
 
-        // Speaker names come from a second endpoint. It is supplementary, so a
-        // failure there (missing scope, say) degrades to raw speaker IDs rather
-        // than losing the transcript. Both requests go out together.
+        // Access gate. Parties decide both whether the team was on a call and
+        // (later) the speaker names, so one lookup serves both. If it fails we
+        // refuse rather than risk returning a call the team wasn't on.
+        let gateParties = new Map<string, GongParty[]>();
+        let ids = callIds;
+        let blocked: string[] = [];
+        if (roster.configured) {
+          gateParties = await client.getCallParties(callIds);
+          ids = callIds.filter((id) => partiesIncludeTeam(gateParties.get(id) ?? [], roster));
+          blocked = callIds.filter((id) => !ids.includes(id));
+          if (ids.length === 0) {
+            return errorResult(
+              `None of the requested calls are accessible: ${NO_TEAM_MEMBER_MESSAGE}`,
+            );
+          }
+        }
+
+        // Speaker names come from the parties endpoint. It is supplementary, so
+        // a failure there degrades to raw speaker IDs rather than losing the
+        // transcript. Reuse the gate's parties when we already have them.
         const [callTranscripts, partiesByCall] = await Promise.all([
-          client.retrieveTranscripts(callIds),
-          resolveSpeakers
-            ? client.getCallParties(callIds).catch((error): Map<string, GongParty[]> => {
-                console.error(`Could not resolve speaker names, falling back to speaker IDs: ${error}`);
-                return new Map();
-              })
-            : Promise.resolve(new Map<string, GongParty[]>()),
+          client.retrieveTranscripts(ids),
+          !resolveSpeakers
+            ? Promise.resolve(new Map<string, GongParty[]>())
+            : gateParties.size > 0
+              ? Promise.resolve(gateParties)
+              : client.getCallParties(ids).catch((error): Map<string, GongParty[]> => {
+                  console.error(`Could not resolve speaker names, falling back to speaker IDs: ${error}`);
+                  return new Map();
+                }),
         ]);
 
         const narrowingHint = "Request fewer call IDs per call.";
+        const blockedNote =
+          blocked.length > 0
+            ? `${blocked.length} requested call(s) were withheld because ${NO_TEAM_MEMBER_MESSAGE}`
+            : undefined;
+
         if (format === "json") {
           const parties = Object.fromEntries(partiesByCall);
           return jsonResult(
-            resolveSpeakers ? { callTranscripts, parties } : { callTranscripts },
+            {
+              ...(resolveSpeakers ? { callTranscripts, parties } : { callTranscripts }),
+              ...(blockedNote ? { note: blockedNote } : {}),
+            },
             narrowingHint,
           );
         }
-        return guardSize(formatTranscripts(callTranscripts, partiesByCall), narrowingHint);
+        const body = formatTranscripts(callTranscripts, partiesByCall);
+        return guardSize(blockedNote ? `_${blockedNote}_\n\n${body}` : body, narrowingHint);
       } catch (error) {
         return errorResult(describeError(error));
       }
@@ -500,7 +609,15 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
     },
     async ({ callId }) => {
       try {
-        const highlights = await getClient().getCallHighlights(callId);
+        const client = getClient();
+        const roster = teamRoster();
+        if (roster.configured) {
+          const parties = await client.getCallParties([callId]);
+          if (!partiesIncludeTeam(parties.get(callId) ?? [], roster)) {
+            return errorResult(`This call is not accessible: ${NO_TEAM_MEMBER_MESSAGE}`);
+          }
+        }
+        const highlights = await client.getCallHighlights(callId);
         return jsonResult(highlights, "Request a single call ID.");
       } catch (error) {
         return errorResult(describeError(error));
@@ -637,29 +754,50 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         // Which calls to consider: the most recent in the window, capped so the
         // transcript fetches that follow stay within one function's budget.
         const listed = await client.listCalls({ fromDateTime, toDateTime, limit: maxCalls });
-        const candidates = listed.calls;
+        let candidates = listed.calls;
         if (candidates.length === 0) {
           return jsonResult({ query: queryEcho, scanned: 0, matchCount: 0, matches: [] }, "Widen the date range.");
         }
 
-        const metaById = new Map(candidates.map((call) => [call.id, call]));
         const notes: string[] = [];
+        const roster = teamRoster();
 
-        // Anything that classifies speakers — the participants filter, the
-        // per-line mentionedBy/raisedBy filters, or naming speakers — needs the
-        // parties, which live on a separate endpoint. Fetch them once, up front:
-        // for the participants filter this is also a net saving, since excluded
-        // calls then never incur their (much larger) transcript fetch.
+        // Parties drive three things — the team-access gate, the participants/
+        // mentionedBy/raisedBy filters, and speaker names — so fetch them once.
         const affiliationFilters = participants !== "all" || mentionedBy !== "anyone" || raisedBy !== "anyone";
         let candidateParties = new Map<string, GongParty[]>();
-        if (affiliationFilters || resolveSpeakers) {
+        if (roster.configured || affiliationFilters || resolveSpeakers) {
           candidateParties = await client
             .getCallParties(candidates.map((call) => call.id))
             .catch((error): Map<string, GongParty[]> => {
-              console.error(`Could not fetch participant affiliation: ${error}`);
+              console.error(`Could not fetch participant data: ${error}`);
               return new Map();
             });
         }
+
+        // Team-access gate first — never scan a call the team wasn't on. If the
+        // parties lookup failed we cannot verify membership, so refuse outright
+        // rather than risk exposing calls the team was not part of.
+        if (roster.configured) {
+          if (candidateParties.size === 0) {
+            return errorResult(
+              "Could not verify call participants against the team roster, so the search was refused " +
+                "rather than risk exposing calls your team was not part of.",
+            );
+          }
+          const before = candidates.length;
+          candidates = candidates.filter((call) => partiesIncludeTeam(candidateParties.get(call.id) ?? [], roster));
+          const removed = before - candidates.length;
+          if (removed > 0) notes.push(`Team access: excluded ${removed} call(s) with no CS/SDR/AE participant.`);
+          if (candidates.length === 0) {
+            return jsonResult(
+              { query: queryEcho, scanned: 0, matchCount: 0, note: notes.join(" "), matches: [] },
+              "No calls in this window had a team member on them.",
+            );
+          }
+        }
+
+        const metaById = new Map(candidates.map((call) => [call.id, call]));
 
         // If the lookup failed but affiliation-based filters were requested, fall
         // back to searching everything rather than silently returning nothing.
