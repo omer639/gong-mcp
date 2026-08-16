@@ -76,6 +76,42 @@ export interface GongParty {
   methods?: string[];
 }
 
+/** One CRM system's objects that Gong has linked to a call (Salesforce, HubSpot, …). */
+export interface GongCrmContext {
+  system?: string;
+  objects?: Array<{
+    objectType?: string;
+    objectId?: string;
+    fields?: Array<{ name?: string; value?: unknown }>;
+  }>;
+}
+
+/** Participants plus the CRM account names linked to a call. */
+export interface CallAccessInfo {
+  parties: GongParty[];
+  /** Names of CRM accounts/companies Gong associated with the call; empty when none. */
+  crmAccounts: string[];
+}
+
+/**
+ * Pulls customer account/company names out of Gong's CRM context. Salesforce
+ * calls them "Account", HubSpot "Company"; other object types (Deal, Contact,
+ * Lead) are ignored, since it's the account link that marks a real customer.
+ */
+export function crmAccountNames(context: GongCrmContext[] | undefined): string[] {
+  const names: string[] = [];
+  for (const system of context ?? []) {
+    for (const object of system.objects ?? []) {
+      if (object.objectType !== "Account" && object.objectType !== "Company") continue;
+      const nameField = (object.fields ?? []).find(
+        (field) => field.name === "name" || field.name === "Name",
+      );
+      names.push(typeof nameField?.value === "string" ? nameField.value : "(unnamed account)");
+    }
+  }
+  return names;
+}
+
 export interface GongHighlight {
   title?: string;
   items?: Array<{ description: string; speakerId?: string; startTime?: number }>;
@@ -342,13 +378,17 @@ export class GongClient {
   }
 
   /**
-   * Participants for the given calls, keyed by call ID.
+   * Participants plus CRM account context for the given calls, keyed by call ID.
    *
-   * Transcripts identify speakers only by an opaque `speakerId`, so resolving
-   * names needs this second endpoint. One request covers every requested call.
+   * Both come from `/calls/extensive`: `parties` (who was on the call, needed to
+   * resolve speaker names and to check team membership) and `context` (the CRM
+   * objects Gong has linked to the call — used to tell a real customer call from
+   * an internal one with an external guest). `context: "Extended"` is a valid
+   * request regardless of whether a CRM is integrated; with none, `crmAccounts`
+   * just comes back empty.
    */
-  async getCallParties(callIds: string[]): Promise<Map<string, GongParty[]>> {
-    const byCall = new Map<string, GongParty[]>();
+  async getCallAccessInfo(callIds: string[]): Promise<Map<string, CallAccessInfo>> {
+    const byCall = new Map<string, CallAccessInfo>();
 
     // Chunk so no single request carries an unbounded body, and follow Gong's
     // cursor within each chunk: `/calls/extensive` pages at 100 records, so a
@@ -358,24 +398,35 @@ export class GongClient {
       let cursor: string | undefined;
       do {
         const response = await this.request<{
-          calls?: Array<{ metaData?: { id?: string }; parties?: GongParty[] }>;
+          calls?: Array<{ metaData?: { id?: string }; parties?: GongParty[]; context?: GongCrmContext[] }>;
           records?: GongRecords;
         }>("POST", "/calls/extensive", {
           body: {
             filter: { callIds: chunk },
-            contentSelector: { exposedFields: { parties: true } },
+            contentSelector: { context: "Extended", exposedFields: { parties: true } },
             ...(cursor ? { cursor } : {}),
           },
         });
 
         for (const call of response.calls ?? []) {
           const id = call.metaData?.id;
-          if (id) byCall.set(id, call.parties ?? []);
+          if (id) byCall.set(id, { parties: call.parties ?? [], crmAccounts: crmAccountNames(call.context) });
         }
         cursor = response.records?.cursor;
       } while (cursor);
     }
 
+    return byCall;
+  }
+
+  /**
+   * Participants for the given calls, keyed by call ID. Speaker-name resolution
+   * needs only the parties, so this drops the CRM context from getCallAccessInfo.
+   */
+  async getCallParties(callIds: string[]): Promise<Map<string, GongParty[]>> {
+    const info = await this.getCallAccessInfo(callIds);
+    const byCall = new Map<string, GongParty[]>();
+    for (const [id, entry] of info) byCall.set(id, entry.parties);
     return byCall;
   }
 
