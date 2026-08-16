@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 import {
+  type CallAccessInfo,
   GongApiError,
   type GongCall,
   type GongCallTranscript,
@@ -206,6 +207,8 @@ interface TranscriptMatch {
   started?: string;
   /** Whether the call had an external participant; "unknown" when no party data was available. */
   affiliation?: CallAffiliation;
+  /** CRM account(s) Gong linked the call to, when any — the customer's name. */
+  accounts?: string[];
   /** Affiliation of the first speaker to mention the topic — who raised it. */
   topicRaisedBy?: CallAffiliation;
   /** Which of the query phrases appear in this call (under the mentionedBy filter, if any). */
@@ -417,6 +420,22 @@ function teamRoster(): TeamRoster {
   return { userIds, emails, configured: userIds.size > 0 || emails.size > 0 };
 }
 
+/**
+ * When GONG_REQUIRE_CRM_ACCOUNT is on, a call is in scope only if Gong has
+ * linked it to a CRM account — i.e. the external side is a known customer, not
+ * a board member, investor, advisor or vendor. Closes the one residual gap in
+ * the participation gate: an internal/leadership call where a non-customer
+ * external happens to speak alongside a rostered manager. Off by default so the
+ * gate never hides everything before the operator has confirmed Gong actually
+ * returns CRM context (see the README's Access control section).
+ */
+function requireCrmAccount(): boolean {
+  const value = (process.env.GONG_REQUIRE_CRM_ACCOUNT ?? "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+
+const EMPTY_ACCESS: CallAccessInfo = { parties: [], crmAccounts: [] };
+
 /** True when at least one participant on the call is a roster member. */
 function partiesIncludeTeam(parties: GongParty[], roster: TeamRoster): boolean {
   return parties.some(
@@ -439,14 +458,19 @@ function partiesIncludeTeam(parties: GongParty[], roster: TeamRoster): boolean {
  * A call whose customer side Gong left untagged falls out too — erring toward
  * hiding, the safe way to err here.
  */
-function callInScope(parties: GongParty[], roster: TeamRoster): boolean {
-  const externalSpoke = parties.some(
+function callInScope(info: CallAccessInfo, roster: TeamRoster, needCrmAccount: boolean): boolean {
+  const externalSpoke = info.parties.some(
     (party) =>
       party.affiliation === "External" &&
       typeof party.speakerId === "string" &&
       party.speakerId.length > 0,
   );
-  return externalSpoke && partiesIncludeTeam(parties, roster);
+  if (!externalSpoke) return false;
+  if (!partiesIncludeTeam(info.parties, roster)) return false;
+  // The customer/prospect side must be a known CRM account, not a board member,
+  // investor, advisor or vendor who merely happened to speak.
+  if (needCrmAccount && info.crmAccounts.length === 0) return false;
+  return true;
 }
 
 /** Human-facing refusal shared by every tool when the gate blocks a call. */
@@ -467,8 +491,9 @@ async function filterCallsInScope(
   roster: TeamRoster,
 ): Promise<GongCall[]> {
   if (calls.length === 0) return calls;
-  const parties = await client.getCallParties(calls.map((call) => call.id));
-  return calls.filter((call) => callInScope(parties.get(call.id) ?? [], roster));
+  const info = await client.getCallAccessInfo(calls.map((call) => call.id));
+  const needCrmAccount = requireCrmAccount();
+  return calls.filter((call) => callInScope(info.get(call.id) ?? EMPTY_ACCESS, roster, needCrmAccount));
 }
 
 /**
@@ -556,15 +581,17 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         const client = getClient();
         const roster = teamRoster();
 
-        // Access gate. Parties decide both whether the team was on a call and
-        // (later) the speaker names, so one lookup serves both. If it fails we
-        // refuse rather than risk returning a call the team wasn't on.
-        let gateParties = new Map<string, GongParty[]>();
+        // Access gate. One extensive lookup yields parties + CRM context, which
+        // decide both whether the call is in scope and (later) the speaker
+        // names. If it fails we refuse rather than risk returning a call the
+        // team wasn't on.
+        let gateInfo = new Map<string, CallAccessInfo>();
         let ids = callIds;
         let blocked: string[] = [];
         if (roster.configured) {
-          gateParties = await client.getCallParties(callIds);
-          ids = callIds.filter((id) => callInScope(gateParties.get(id) ?? [], roster));
+          const needCrmAccount = requireCrmAccount();
+          gateInfo = await client.getCallAccessInfo(callIds);
+          ids = callIds.filter((id) => callInScope(gateInfo.get(id) ?? EMPTY_ACCESS, roster, needCrmAccount));
           blocked = callIds.filter((id) => !ids.includes(id));
           if (ids.length === 0) {
             return errorResult(
@@ -576,12 +603,17 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         // Speaker names come from the parties endpoint. It is supplementary, so
         // a failure there degrades to raw speaker IDs rather than losing the
         // transcript. Reuse the gate's parties when we already have them.
+        const partiesFromGate = (): Map<string, GongParty[]> => {
+          const map = new Map<string, GongParty[]>();
+          for (const [id, entry] of gateInfo) map.set(id, entry.parties);
+          return map;
+        };
         const [callTranscripts, partiesByCall] = await Promise.all([
           client.retrieveTranscripts(ids),
           !resolveSpeakers
             ? Promise.resolve(new Map<string, GongParty[]>())
-            : gateParties.size > 0
-              ? Promise.resolve(gateParties)
+            : gateInfo.size > 0
+              ? Promise.resolve(partiesFromGate())
               : client.getCallParties(ids).catch((error): Map<string, GongParty[]> => {
                   console.error(`Could not resolve speaker names, falling back to speaker IDs: ${error}`);
                   return new Map();
@@ -629,8 +661,8 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         const client = getClient();
         const roster = teamRoster();
         if (roster.configured) {
-          const parties = await client.getCallParties([callId]);
-          if (!callInScope(parties.get(callId) ?? [], roster)) {
+          const info = await client.getCallAccessInfo([callId]);
+          if (!callInScope(info.get(callId) ?? EMPTY_ACCESS, roster, requireCrmAccount())) {
             return errorResult(`This call is not accessible: ${OUT_OF_SCOPE_MESSAGE}`);
           }
         }
@@ -779,31 +811,38 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         const notes: string[] = [];
         const roster = teamRoster();
 
-        // Parties drive three things — the team-access gate, the participants/
-        // mentionedBy/raisedBy filters, and speaker names — so fetch them once.
+        // One extensive lookup drives four things — the team-access gate, the
+        // participants/mentionedBy/raisedBy filters, speaker names, and the CRM
+        // account signal — so fetch parties + context once.
         const affiliationFilters = participants !== "all" || mentionedBy !== "anyone" || raisedBy !== "anyone";
-        let candidateParties = new Map<string, GongParty[]>();
+        let accessByCall = new Map<string, CallAccessInfo>();
         if (roster.configured || affiliationFilters || resolveSpeakers) {
-          candidateParties = await client
-            .getCallParties(candidates.map((call) => call.id))
-            .catch((error): Map<string, GongParty[]> => {
+          accessByCall = await client
+            .getCallAccessInfo(candidates.map((call) => call.id))
+            .catch((error): Map<string, CallAccessInfo> => {
               console.error(`Could not fetch participant data: ${error}`);
               return new Map();
             });
         }
+        // Parties view of the same data, for the affiliation filters and names.
+        const candidateParties = new Map<string, GongParty[]>();
+        for (const [id, info] of accessByCall) candidateParties.set(id, info.parties);
 
         // Team-access gate first — never scan a call the team wasn't on. If the
-        // parties lookup failed we cannot verify membership, so refuse outright
-        // rather than risk exposing calls the team was not part of.
+        // lookup failed we cannot verify membership, so refuse outright rather
+        // than risk exposing calls the team was not part of.
         if (roster.configured) {
-          if (candidateParties.size === 0) {
+          if (accessByCall.size === 0) {
             return errorResult(
               "Could not verify call participants against the team roster, so the search was refused " +
                 "rather than risk exposing calls your team was not part of.",
             );
           }
+          const needCrmAccount = requireCrmAccount();
           const before = candidates.length;
-          candidates = candidates.filter((call) => callInScope(candidateParties.get(call.id) ?? [], roster));
+          candidates = candidates.filter((call) =>
+            callInScope(accessByCall.get(call.id) ?? EMPTY_ACCESS, roster, needCrmAccount),
+          );
           const removed = before - candidates.length;
           if (removed > 0) notes.push(`Team access: excluded ${removed} non-customer-facing call(s).`);
           if (candidates.length === 0) {
@@ -899,6 +938,13 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         // Resolve display fields from the parties we already hold.
         if (matches.length > 0 && candidateParties.size > 0) {
           annotateMatches(matches, candidateParties, resolveSpeakers);
+        }
+        // Surface the CRM account when Gong linked one — useful context, and it
+        // lets an operator confirm CRM data is present before turning on
+        // GONG_REQUIRE_CRM_ACCOUNT.
+        for (const match of matches) {
+          const accounts = accessByCall.get(match.callId)?.crmAccounts;
+          if (accounts && accounts.length > 0) match.accounts = accounts;
         }
 
         if (effMentionedBy !== "anyone" || effRaisedBy !== "anyone") {
