@@ -386,15 +386,19 @@ function matchTranscript(
  *
  * Gong's API key sees every call in the workspace — private and internal ones
  * included — and Gong offers no way to scope a key per user. So access is
- * gated here instead: a call is only ever exposed if a roster member actually
- * took part in it. Everything the team wasn't on (exec, HR, M&A, strategy)
- * stays invisible, which is a far more robust rule than trying to detect which
- * calls are "sensitive".
+ * gated here instead. A call is exposed only when it is a customer-facing
+ * sales/CS call, defined as: a roster member is on it AND a customer/prospect
+ * actually *spoke* on it (see callInScope for why "spoke", not just "invited").
  *
  * Configure with GONG_TEAM_USER_IDS and/or GONG_TEAM_EMAILS (comma-separated).
- * User IDs are the stable, reliable match; emails are easier to maintain. When
- * neither is set the gate is inactive and every call the key can see is exposed
- * — so a deployment that serves a whole team must set at least one.
+ * List the actual sales / CS / SDR / support reps — NOT leadership. The roster
+ * is what excludes leadership/vendor calls that have a real external speaker:
+ * a CRO↔vendor or exec↔investor call has an external speaker but, with the CRO
+ * off the roster, no rostered rep, so it stays out. Put a leader on the roster
+ * only if you intend their external calls to be visible to everyone. User IDs
+ * are the stable match; emails are easier to maintain. When neither is set the
+ * gate is inactive and every call the key can see is exposed — so a deployment
+ * serving others must set at least one.
  */
 interface TeamRoster {
   userIds: Set<string>;
@@ -422,36 +426,49 @@ function partiesIncludeTeam(parties: GongParty[], roster: TeamRoster): boolean {
   );
 }
 
-/** Human-facing refusal shared by every tool when the roster blocks a call. */
-const NO_TEAM_MEMBER_MESSAGE =
-  "no CS/SDR/AE team member took part in it, so it is not accessible through this tool.";
+/**
+ * Whether a call is in scope: a roster member is on it AND a customer/prospect
+ * actually *spoke* on it.
+ *
+ * The "spoke" part matters. Internal meetings (a revenue sync, a churn review)
+ * routinely carry a non-speaking external party — an invited advisor, a
+ * calendar guest, a note-taker — which makes "has an external participant" true
+ * even though no customer was really there. Requiring a external *speaker*
+ * (a party with a speakerId, i.e. one Gong actually heard talk) drops those
+ * while keeping every real customer call, where the customer always speaks.
+ * A call whose customer side Gong left untagged falls out too — erring toward
+ * hiding, the safe way to err here.
+ */
+function callInScope(parties: GongParty[], roster: TeamRoster): boolean {
+  const externalSpoke = parties.some(
+    (party) =>
+      party.affiliation === "External" &&
+      typeof party.speakerId === "string" &&
+      party.speakerId.length > 0,
+  );
+  return externalSpoke && partiesIncludeTeam(parties, roster);
+}
+
+/** Human-facing refusal shared by every tool when the gate blocks a call. */
+const OUT_OF_SCOPE_MESSAGE =
+  "it is not a customer-facing sales/CS call (it needs both a sales/CS/SDR/support team member " +
+  "and a customer/prospect on it), so it is not accessible through this tool.";
 
 /**
- * Filters a listed page down to calls the team took part in.
+ * Filters a listed page down to in-scope customer-facing calls.
  *
- * Uses the call owner (`primaryUserId`) as a free first pass — most reps own
- * their own calls — and only pays for a parties lookup on the calls that pass
- * involves someone off the owner list. Recency order is preserved.
+ * Both conditions need participant data (the external check can't be inferred
+ * from the call owner alone), so this fetches parties for every call. Recency
+ * order is preserved.
  */
-async function filterCallsToTeam(
+async function filterCallsInScope(
   client: GongClient,
   calls: GongCall[],
   roster: TeamRoster,
 ): Promise<GongCall[]> {
-  const order = new Map(calls.map((call, index) => [call.id, index]));
-  const kept: GongCall[] = [];
-  const uncertain: GongCall[] = [];
-  for (const call of calls) {
-    if (call.primaryUserId && roster.userIds.has(call.primaryUserId)) kept.push(call);
-    else uncertain.push(call);
-  }
-  if (uncertain.length > 0) {
-    const parties = await client.getCallParties(uncertain.map((call) => call.id));
-    for (const call of uncertain) {
-      if (partiesIncludeTeam(parties.get(call.id) ?? [], roster)) kept.push(call);
-    }
-  }
-  return kept.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+  if (calls.length === 0) return calls;
+  const parties = await client.getCallParties(calls.map((call) => call.id));
+  return calls.filter((call) => callInScope(parties.get(call.id) ?? [], roster));
 }
 
 /**
@@ -496,7 +513,7 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         if (roster.configured) {
           // Gate before returning: even a call's title can be sensitive, so
           // calls with no team member are dropped from the listing entirely.
-          result.calls = await filterCallsToTeam(client, result.calls, roster);
+          result.calls = await filterCallsInScope(client, result.calls, roster);
         }
         return jsonResult(result, "Narrow the date range or set a smaller limit.");
       } catch (error) {
@@ -547,11 +564,11 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         let blocked: string[] = [];
         if (roster.configured) {
           gateParties = await client.getCallParties(callIds);
-          ids = callIds.filter((id) => partiesIncludeTeam(gateParties.get(id) ?? [], roster));
+          ids = callIds.filter((id) => callInScope(gateParties.get(id) ?? [], roster));
           blocked = callIds.filter((id) => !ids.includes(id));
           if (ids.length === 0) {
             return errorResult(
-              `None of the requested calls are accessible: ${NO_TEAM_MEMBER_MESSAGE}`,
+              `None of the requested calls are accessible: ${OUT_OF_SCOPE_MESSAGE}`,
             );
           }
         }
@@ -574,7 +591,7 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         const narrowingHint = "Request fewer call IDs per call.";
         const blockedNote =
           blocked.length > 0
-            ? `${blocked.length} requested call(s) were withheld because ${NO_TEAM_MEMBER_MESSAGE}`
+            ? `${blocked.length} requested call(s) were withheld because ${OUT_OF_SCOPE_MESSAGE}`
             : undefined;
 
         if (format === "json") {
@@ -613,8 +630,8 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         const roster = teamRoster();
         if (roster.configured) {
           const parties = await client.getCallParties([callId]);
-          if (!partiesIncludeTeam(parties.get(callId) ?? [], roster)) {
-            return errorResult(`This call is not accessible: ${NO_TEAM_MEMBER_MESSAGE}`);
+          if (!callInScope(parties.get(callId) ?? [], roster)) {
+            return errorResult(`This call is not accessible: ${OUT_OF_SCOPE_MESSAGE}`);
           }
         }
         const highlights = await client.getCallHighlights(callId);
@@ -786,9 +803,9 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
             );
           }
           const before = candidates.length;
-          candidates = candidates.filter((call) => partiesIncludeTeam(candidateParties.get(call.id) ?? [], roster));
+          candidates = candidates.filter((call) => callInScope(candidateParties.get(call.id) ?? [], roster));
           const removed = before - candidates.length;
-          if (removed > 0) notes.push(`Team access: excluded ${removed} call(s) with no CS/SDR/AE participant.`);
+          if (removed > 0) notes.push(`Team access: excluded ${removed} non-customer-facing call(s).`);
           if (candidates.length === 0) {
             return jsonResult(
               { query: queryEcho, scanned: 0, matchCount: 0, note: notes.join(" "), matches: [] },
