@@ -191,6 +191,7 @@ Notes that apply either way:
 - It **fails closed**: if the participant/CRM lookup can't be completed, the tools refuse rather than risk exposing an out-of-scope call.
 - **One trade-off of the CRM requirement:** a brand-new prospect not yet in your CRM would be hidden until the account is created (erring toward hiding). Layer a roster if you want to catch those pre-CRM intro calls.
 - This is a *positive allow-list by participation*, deliberately, rather than trying to detect which calls are "sensitive" — the `isPrivate` flag only catches calls someone explicitly marked, not the many that simply are.
+- **Mandatory by default (fail-closed).** With neither a CRM requirement nor a roster configured, every tool **refuses** rather than serve the whole library — so a missing or mistyped `GONG_REQUIRE_CRM_ACCOUNT`, or an env that didn't survive a redeploy, can't silently open access. To run with no gate on purpose (local / single-user), set `GONG_ALLOW_UNGATED=true`.
 - **Limits worth knowing:** the gate can't express "person A sees less than person B" — everyone connected gets the same customer-facing view. And a genuinely customer-facing call is visible to the whole team even if it's sensitive. Per-person visibility matching each user's own Gong permissions would require per-user Gong OAuth, which this server does not implement. With **neither signal set, the gate is off** and every call the key can see is exposed — so set one before serving more than yourself.
 
 ### Serverless constraints worth knowing

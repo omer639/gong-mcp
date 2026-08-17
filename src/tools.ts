@@ -486,6 +486,33 @@ function gateActive(roster: TeamRoster): boolean {
   return roster.configured || requireCrmAccount();
 }
 
+/**
+ * Explicit opt-in to run with NO access gate. Without this, a deployment that
+ * configures no gate refuses every request rather than silently exposing the
+ * whole call library — fail-closed, so a missing/typo'd GONG_REQUIRE_CRM_ACCOUNT
+ * (or an env that didn't survive a redeploy) can't quietly open everything.
+ * Meant for local/single-user use where the operator owns the credentials.
+ */
+function allowUngated(): boolean {
+  const value = (process.env.GONG_ALLOW_UNGATED ?? "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+
+/**
+ * Returned by every tool before it does anything: if no gate is configured and
+ * ungated access wasn't explicitly allowed, refuse. This is what makes the gate
+ * mandatory — the server won't serve calls unless access control is on.
+ */
+function refuseIfUngated(roster: TeamRoster): ToolResult | undefined {
+  if (gateActive(roster) || allowUngated()) return undefined;
+  return errorResult(
+    "Refusing every request: no access gate is configured, so serving calls would expose the entire " +
+      "Gong library. Set GONG_REQUIRE_CRM_ACCOUNT=true (recommended) or an access roster " +
+      "(GONG_TEAM_EMAILS / GONG_TEAM_USER_IDS). To intentionally run with no gate (local/single-user), " +
+      "set GONG_ALLOW_UNGATED=true.",
+  );
+}
+
 /** Human-facing refusal shared by every tool when the gate blocks a call. */
 const OUT_OF_SCOPE_MESSAGE =
   "it is not a customer-facing sales/CS call (it must have a customer/prospect who spoke — and, per " +
@@ -552,6 +579,8 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
       try {
         const client = getClient();
         const roster = teamRoster();
+        const ungated = refuseIfUngated(roster);
+        if (ungated) return ungated;
         const result = await client.listCalls({ fromDateTime, toDateTime, limit });
         if (gateActive(roster)) {
           // Gate before returning: even a call's title can be sensitive, so
@@ -598,6 +627,8 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
       try {
         const client = getClient();
         const roster = teamRoster();
+        const ungated = refuseIfUngated(roster);
+        if (ungated) return ungated;
 
         // Access gate. One extensive lookup yields parties + CRM context, which
         // decide both whether the call is in scope and (later) the speaker
@@ -678,6 +709,8 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
       try {
         const client = getClient();
         const roster = teamRoster();
+        const ungated = refuseIfUngated(roster);
+        if (ungated) return ungated;
         if (gateActive(roster)) {
           const info = await client.getCallAccessInfo([callId]);
           if (!callInScope(info.get(callId) ?? EMPTY_ACCESS, roster, requireCrmAccount())) {
@@ -828,6 +861,8 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
 
         const notes: string[] = [];
         const roster = teamRoster();
+        const ungated = refuseIfUngated(roster);
+        if (ungated) return ungated;
 
         // One extensive lookup drives four things — the team-access gate, the
         // participants/mentionedBy/raisedBy filters, speaker names, and the CRM
