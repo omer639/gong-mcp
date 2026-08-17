@@ -434,7 +434,7 @@ function requireCrmAccount(): boolean {
   return value === "1" || value === "true" || value === "yes";
 }
 
-const EMPTY_ACCESS: CallAccessInfo = { parties: [], crmAccounts: [] };
+const EMPTY_ACCESS: CallAccessInfo = { parties: [], crmAccounts: [], isPrivate: false };
 
 /** True when at least one participant on the call is a roster member. */
 function partiesIncludeTeam(parties: GongParty[], roster: TeamRoster): boolean {
@@ -459,6 +459,9 @@ function partiesIncludeTeam(parties: GongParty[], roster: TeamRoster): boolean {
  * hiding, the safe way to err here.
  */
 function callInScope(info: CallAccessInfo, roster: TeamRoster, needCrmAccount: boolean): boolean {
+  // A call explicitly marked private in Gong is never exposed while the gate is
+  // on, whatever else is true of it.
+  if (info.isPrivate) return false;
   const externalSpoke = info.parties.some(
     (party) =>
       party.affiliation === "External" &&
@@ -504,7 +507,11 @@ async function filterCallsInScope(
   if (calls.length === 0) return calls;
   const info = await client.getCallAccessInfo(calls.map((call) => call.id));
   const needCrmAccount = requireCrmAccount();
-  return calls.filter((call) => callInScope(info.get(call.id) ?? EMPTY_ACCESS, roster, needCrmAccount));
+  return calls.filter(
+    // `call.isPrivate` is the reliable list-sourced privacy flag; the access
+    // check covers the rest (and the private flag again, from extensive).
+    (call) => call.isPrivate !== true && callInScope(info.get(call.id) ?? EMPTY_ACCESS, roster, needCrmAccount),
+  );
 }
 
 /**
@@ -851,8 +858,10 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
           }
           const needCrmAccount = requireCrmAccount();
           const before = candidates.length;
-          candidates = candidates.filter((call) =>
-            callInScope(accessByCall.get(call.id) ?? EMPTY_ACCESS, roster, needCrmAccount),
+          candidates = candidates.filter(
+            (call) =>
+              call.isPrivate !== true &&
+              callInScope(accessByCall.get(call.id) ?? EMPTY_ACCESS, roster, needCrmAccount),
           );
           const removed = before - candidates.length;
           if (removed > 0) notes.push(`Team access: excluded ${removed} non-customer-facing call(s).`);

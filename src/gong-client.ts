@@ -33,6 +33,8 @@ export interface GongCall {
   duration?: number;
   /** Gong user ID of the call owner. */
   primaryUserId?: string;
+  /** True when the call is marked private in Gong. */
+  isPrivate?: boolean;
   direction?: string;
   system?: string;
   scope?: string;
@@ -86,11 +88,13 @@ export interface GongCrmContext {
   }>;
 }
 
-/** Participants plus the CRM account names linked to a call. */
+/** Participants, CRM account names, and privacy flag for a call. */
 export interface CallAccessInfo {
   parties: GongParty[];
   /** Names of CRM accounts/companies Gong associated with the call; empty when none. */
   crmAccounts: string[];
+  /** True when the call is marked private in Gong — never exposed while the gate is on. */
+  isPrivate: boolean;
 }
 
 /**
@@ -398,7 +402,11 @@ export class GongClient {
       let cursor: string | undefined;
       do {
         const response = await this.request<{
-          calls?: Array<{ metaData?: { id?: string }; parties?: GongParty[]; context?: GongCrmContext[] }>;
+          calls?: Array<{
+            metaData?: { id?: string; isPrivate?: boolean };
+            parties?: GongParty[];
+            context?: GongCrmContext[];
+          }>;
           records?: GongRecords;
         }>("POST", "/calls/extensive", {
           body: {
@@ -410,7 +418,12 @@ export class GongClient {
 
         for (const call of response.calls ?? []) {
           const id = call.metaData?.id;
-          if (id) byCall.set(id, { parties: call.parties ?? [], crmAccounts: crmAccountNames(call.context) });
+          if (id)
+            byCall.set(id, {
+              parties: call.parties ?? [],
+              crmAccounts: crmAccountNames(call.context),
+              isPrivate: call.metaData?.isPrivate === true,
+            });
         }
         cursor = response.records?.cursor;
       } while (cursor);
