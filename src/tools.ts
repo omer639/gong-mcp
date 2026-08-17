@@ -466,17 +466,28 @@ function callInScope(info: CallAccessInfo, roster: TeamRoster, needCrmAccount: b
       party.speakerId.length > 0,
   );
   if (!externalSpoke) return false;
-  if (!partiesIncludeTeam(info.parties, roster)) return false;
+  // Roster check applies only when a roster is configured. With the CRM-account
+  // requirement on, the roster is optional: a call linked to a known customer
+  // account with a customer speaking is a customer call regardless of which
+  // internal person hosted it, so "is it a known account" replaces the need to
+  // enumerate reps and exclude managers.
+  if (roster.configured && !partiesIncludeTeam(info.parties, roster)) return false;
   // The customer/prospect side must be a known CRM account, not a board member,
   // investor, advisor or vendor who merely happened to speak.
   if (needCrmAccount && info.crmAccounts.length === 0) return false;
   return true;
 }
 
+/** The gate runs when either an access roster or the CRM-account requirement is set. */
+function gateActive(roster: TeamRoster): boolean {
+  return roster.configured || requireCrmAccount();
+}
+
 /** Human-facing refusal shared by every tool when the gate blocks a call. */
 const OUT_OF_SCOPE_MESSAGE =
-  "it is not a customer-facing sales/CS call (it needs both a sales/CS/SDR/support team member " +
-  "and a customer/prospect on it), so it is not accessible through this tool.";
+  "it is not a customer-facing sales/CS call (it must have a customer/prospect who spoke — and, per " +
+  "this deployment's settings, be tied to a known CRM account and/or include a team member), so it " +
+  "is not accessible through this tool.";
 
 /**
  * Filters a listed page down to in-scope customer-facing calls.
@@ -535,9 +546,9 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         const client = getClient();
         const roster = teamRoster();
         const result = await client.listCalls({ fromDateTime, toDateTime, limit });
-        if (roster.configured) {
+        if (gateActive(roster)) {
           // Gate before returning: even a call's title can be sensitive, so
-          // calls with no team member are dropped from the listing entirely.
+          // out-of-scope calls are dropped from the listing entirely.
           result.calls = await filterCallsInScope(client, result.calls, roster);
         }
         return jsonResult(result, "Narrow the date range or set a smaller limit.");
@@ -588,7 +599,7 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         let gateInfo = new Map<string, CallAccessInfo>();
         let ids = callIds;
         let blocked: string[] = [];
-        if (roster.configured) {
+        if (gateActive(roster)) {
           const needCrmAccount = requireCrmAccount();
           gateInfo = await client.getCallAccessInfo(callIds);
           ids = callIds.filter((id) => callInScope(gateInfo.get(id) ?? EMPTY_ACCESS, roster, needCrmAccount));
@@ -660,7 +671,7 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
       try {
         const client = getClient();
         const roster = teamRoster();
-        if (roster.configured) {
+        if (gateActive(roster)) {
           const info = await client.getCallAccessInfo([callId]);
           if (!callInScope(info.get(callId) ?? EMPTY_ACCESS, roster, requireCrmAccount())) {
             return errorResult(`This call is not accessible: ${OUT_OF_SCOPE_MESSAGE}`);
@@ -816,7 +827,7 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         // account signal — so fetch parties + context once.
         const affiliationFilters = participants !== "all" || mentionedBy !== "anyone" || raisedBy !== "anyone";
         let accessByCall = new Map<string, CallAccessInfo>();
-        if (roster.configured || affiliationFilters || resolveSpeakers) {
+        if (gateActive(roster) || affiliationFilters || resolveSpeakers) {
           accessByCall = await client
             .getCallAccessInfo(candidates.map((call) => call.id))
             .catch((error): Map<string, CallAccessInfo> => {
@@ -828,14 +839,14 @@ export function registerGongTools(server: McpServer, getClient: () => GongClient
         const candidateParties = new Map<string, GongParty[]>();
         for (const [id, info] of accessByCall) candidateParties.set(id, info.parties);
 
-        // Team-access gate first — never scan a call the team wasn't on. If the
-        // lookup failed we cannot verify membership, so refuse outright rather
-        // than risk exposing calls the team was not part of.
-        if (roster.configured) {
+        // Access gate first — never scan a call that's out of scope. If the
+        // lookup failed we cannot verify it, so refuse outright rather than
+        // risk exposing calls the caller shouldn't see.
+        if (gateActive(roster)) {
           if (accessByCall.size === 0) {
             return errorResult(
-              "Could not verify call participants against the team roster, so the search was refused " +
-                "rather than risk exposing calls your team was not part of.",
+              "Could not verify calls against the access rules, so the search was refused " +
+                "rather than risk exposing calls outside your team's customer-facing scope.",
             );
           }
           const needCrmAccount = requireCrmAccount();
